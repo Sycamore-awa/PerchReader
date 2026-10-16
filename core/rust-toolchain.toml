@@ -1,0 +1,10 @@
+# 固定工具链，保证本机（Linux）与云端 macOS CI 使用一致的 Rust 版本。
+# iOS 交叉校验所需 target 也在此声明，rustup 会自动补齐。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-apple-ios",      # 真机（arm64）
+    "aarch64-apple-ios-sim",  # Apple Silicon 模拟器
+    "x86_64-apple-ios",       # Intel 模拟器
+]

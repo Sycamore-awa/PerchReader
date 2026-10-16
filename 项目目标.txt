@@ -1,0 +1,29 @@
+做一款多端电子书阅读器：iOS 先上线，Android/Web/桌面复用同一套 Rust 核心，支持 EPUB/PDF/TXT 导入、阅读、标注、同步，后续可接支付与 DRM。
+核心目标
+
+    导入快：快速登记 + 后台精修 + 延迟索引，1000 本感知上架 <10 秒。
+
+    阅读稳：EPUB/PDF/TXT 打开 <1 秒，基础翻页 60fps，崩溃率 <0.1%。
+
+    同步准：统一 Locator，进度/书签/笔记跨端同步，冲突率 <1%。
+
+    架构可扩展：Rust 核心一次编写，UniFFI 给 Swift/Kotlin，WASM 给 Web。
+ 技术栈
+
+    iOS：SwiftUI + UIKit；阅读页用 WKWebView + Readium Swift；PDF 用 PDFKit。
+
+    跨端核心：Rust，负责解析、索引、同步、Locator、加密；用 UniFFI 给 Swift/Kotlin，用 WASM 给 Web。
+
+    Android：Kotlin + Jetpack Compose + WebView + 同一套 Rust。
+
+    Web/桌面：Readium JS / EPUB.js + Rust WASM；桌面壳可用 Tauri 2，但移动端 UI 不用它统一。
+
+    同步：自建 API / Supabase + 对象存储；CloudKit 只做辅助。统一 Locator：EPUB CFI、PDF 页码坐标、TXT 偏移。
+
+    导入：快速登记 + 后台精修 + 延迟索引 + 缓存。书先上架，封面/目录/全文索引后台补。
+
+    翻页：基础滑动/滚动用 WebView；仿真翻页在 iOS/Android 原生自定义 View 做，Rust 算路径。
+
+
+
+目前只制作ios！！！

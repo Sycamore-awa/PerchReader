@@ -1,0 +1,49 @@
+# ---- Rust ----
+target/
+**/*.rs.bk
+
+# ---- Flutter / Dart ----
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+
+# Flutter 的 iOS/Android 平台目录是生成物；
+# 是否提交视项目约定而定，这里先按"不提交"处理。
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/Flutter.framework
+app/ios/Flutter/Flutter.podspec
+app/ios/Flutter/Generated.xcconfig
+app/ios/Flutter/flutter_export_environment.sh
+app/android/.gradle/
+app/android/local.properties
+app/android/key.properties
+*.jks
+*.keystore
+
+# ---- Xcode ----
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# ---- 构建产物：Rust 交叉编译出的 iOS 静态库与绑定生成物 ----
+# 绑定（ios/Generated 或 app/ios/Generated）建议提交，以便 CI 做漂移检查，
+# 因此这里不忽略；但本地产物目录要忽略。
+/ios/build/
+/core/target/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ---- 本地私有配置 ----
+.env
+.env.local
+*.local.toml

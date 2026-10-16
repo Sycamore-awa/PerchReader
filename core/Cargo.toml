@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["perch-model"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# 核心库的硬性约束：
+# - 禁止 unsafe（核心是纯逻辑，且要能在 Linux 上为 iOS 交叉校验）
+# - 禁止 unwrap / expect / panic —— 所有可预期错误都必须走 Result，
+#   这是"崩溃率 < 0.1%"目标的第一道防线（见 docs/02-架构设计.md §九）
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
