@@ -1,0 +1,17 @@
+[package]
+name = "perch-epub"
+description = "EPUB 容器（ZIP）与 OPF 包文档解析"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
