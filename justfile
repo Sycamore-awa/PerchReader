@@ -46,3 +46,30 @@ ci: fmt-check lint test check-ios check-ios-sim
 
 # 快速回路
 quick: fmt lint test
+
+# ---- Flutter 应用（本机回路：web / Waydroid / 真机） ----
+
+# 生成测试用的中文 EPUB（内容由脚本产出，无版权问题，可随时复现）
+spike-epub:
+    python3 tools/make_spike_epub.py app/assets/spike_book.epub
+
+# Web 回路的一次性准备：把 Readium JS 拷进 app/web/
+# 漏掉这一步会在运行时报 "dart.global.ReadiumReader is not a constructor"
+spike-web-setup:
+    cd app && dart run flutter_readium:copy_js_file web
+
+# 构建 web 产物
+app-web:
+    cd app && flutter build web --release
+
+# 静态分析
+app-analyze:
+    cd app && flutter analyze
+
+# 无头浏览器跑一遍并抓运行时日志（无需图形界面，CI 也能用）
+# 用法：先起服务器（python3 -m http.server 8099 -d app/build/web），再跑这个
+app-headless-check:
+    chromium --headless=new --no-sandbox --disable-dev-shm-usage \
+      --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
+      --enable-logging=stderr --v=0 --virtual-time-budget=60000 --dump-dom \
+      http://localhost:8099/ 2>&1 | grep --line-buffered 'perch-spike'
