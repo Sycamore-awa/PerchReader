@@ -1,5 +1,6 @@
 package com.perch.perch
 
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 
-class MainActivity : FlutterActivity()
+// flutter_readium 要求 FlutterFragmentActivity（见其 README 的 Android 平台配置）
+class MainActivity : FlutterFragmentActivity()
