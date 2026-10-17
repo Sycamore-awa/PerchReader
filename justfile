@@ -91,6 +91,10 @@ ios-symbols: build-ios-lib
 # ---- 组合任务 ----
 
 # 本地 CI：提交前跑这个
+# 阶段①登记吞吐基准（不是被取消的 CJK 索引测量）
+bench-register:
+    cd core && cargo run --release -p perch-import --example bench_register
+
 ci: fmt-check lint test check-ios check-ios-sim ios-symbols
 
 # 快速回路
