@@ -171,6 +171,11 @@ jobs:
         working-directory: app
         run: dart analyze
 
+      # 产品逻辑单测：纯 Dart VM，不需要设备。覆盖进度存储与恢复的完整往返
+      - name: Flutter 单元测试
+        working-directory: app
+        run: flutter test
+
       # 关键的编译验证：模拟器构建**不需要签名**，因此 CI 里可以跑
       # 这条通过就说明：Flutter + flutter_readium（含其 Swift/Kotlin 原生部分）能编进 iOS App
       - name: 编译 iOS（模拟器）

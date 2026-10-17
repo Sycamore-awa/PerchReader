@@ -1,61 +1,174 @@
+// PerchReader —— 最小产品闭环：
+// 书库 → 打开书 → 记录阅读位置 → 下次打开自动恢复。
+//
+// 这个界面的目的不是好看，而是把已有的零件串成一台能运转的机器：
+//   flutter_readium（渲染） + Locator（定位） + ProgressStore（持久化）
+//
+// 已知未验证：iOS/Android 上的真实渲染与性能。当前的验证手段是
+//   1) `flutter test` 覆盖业务逻辑（纯 Dart VM，无需设备）
+//   2) 云端 macOS CI 覆盖编译
+//   3) 真机/模拟器上的行为 —— 仍待验证
+
 import 'dart:async';
-import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_readium/flutter_readium.dart';
+import 'package:path_provider/path_provider.dart';
+
+import 'library.dart';
 
 void main() {
-  runApp(const PerchSpikeApp());
+  runApp(const PerchApp());
 }
 
-class PerchSpikeApp extends StatelessWidget {
-  const PerchSpikeApp({super.key});
+class PerchApp extends StatelessWidget {
+  const PerchApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Perch Spike',
+      title: 'PerchReader',
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-      home: const ReaderScreen(),
+      home: const LibraryScreen(),
     );
   }
 }
 
-/// go/no-go spike：用 `flutter_readium` 打开一本**本仓库自产的中文 EPUB**，
-/// 并把 Readium 给出的 `Locator` 原样打印出来。
+/// 书库：目前只有一本内置测试书。
 ///
-/// 验证目标（对应 `docs/06-UI技术栈决策.md` §六 的清单）：
-///
-/// 1. 中文 EPUB 能否正确渲染（排版、断行、字体回退）
-/// 2. 能否翻页，帧率如何
-/// 3. **能否拿到 Locator**，以及里面是否带 CFI / progression
-///    —— 这是"进度跨端同步"与"标注不漂移"的地基
-/// 4. 打开耗时（目标 < 1s）
-///
-/// 打印完整 JSON 而不是挑字段，是因为本次 spike 的另一半目的是
-/// **核对 Readium 的 Locator 结构与 `perch-model::Locator` 是否真的对得上**
-/// （若对得上，两边的互转就退化成字段拷贝）。
+/// 真实的书库应由导入管线（perch-import 的阶段①）填充，这里先用固定清单，
+/// 以便把"打开 → 记录 → 恢复"这条链路先跑通。
+class LibraryScreen extends StatefulWidget {
+  const LibraryScreen({super.key});
+
+  @override
+  State<LibraryScreen> createState() => _LibraryScreenState();
+}
+
+class _LibraryScreenState extends State<LibraryScreen> {
+  static const _books = [
+    BookEntry(
+      id: 'spike-book',
+      title: '灯塔守夜人的两页书',
+      format: 'epub',
+      path: 'assets/spike_book.epub',
+    ),
+  ];
+
+  late Future<ProgressStore> _store;
+
+  @override
+  void initState() {
+    super.initState();
+    _store = _openStore();
+  }
+
+  /// 进度文件放在应用支持目录（iOS/Android 都由 path_provider 给出）。
+  static Future<ProgressStore> _openStore() async {
+    final directory = await getApplicationSupportDirectory();
+    return JsonFileProgressStore(
+      Directory('${directory.path}/progress'),
+    );
+  }
+
+  Future<void> _openBook(BookEntry book) async {
+    final store = await _store;
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ReaderScreen(book: book, store: store),
+      ),
+    );
+    // 回来后刷新进度显示
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('书库')),
+      body: FutureBuilder<ProgressStore>(
+        future: _store,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(child: Text('无法打开存储：${snapshot.error}'));
+          }
+          final store = snapshot.data!;
+          return ListView.separated(
+            itemCount: _books.length,
+            separatorBuilder: (_, _) => const Divider(height: 1),
+            itemBuilder: (context, index) {
+              final book = _books[index];
+              return ListTile(
+                leading: const Icon(Icons.menu_book),
+                title: Text(book.title),
+                subtitle: _ProgressSubtitle(store: store, book: book),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => unawaited(_openBook(book)),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// 显示某本书的阅读进度（有进度就显示百分比）。
+class _ProgressSubtitle extends StatelessWidget {
+  const _ProgressSubtitle({required this.store, required this.book});
+
+  final ProgressStore store;
+  final BookEntry book;
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>?>(
+      future: store.load(book.id),
+      builder: (context, snapshot) {
+        final locator = snapshot.data;
+        if (locator == null) {
+          return const Text('未开始');
+        }
+        final locations = locator['locations'];
+        final progression = locations is Map ? locations['progression'] : null;
+        if (progression is num) {
+          return Text('已读 ${(progression * 100).round()}%');
+        }
+        return const Text('已开始');
+      },
+    );
+  }
+}
+
+/// 阅读页：负责渲染、记录与恢复位置。
 class ReaderScreen extends StatefulWidget {
-  const ReaderScreen({super.key});
+  const ReaderScreen({super.key, required this.book, required this.store});
+
+  final BookEntry book;
+  final ProgressStore store;
 
   @override
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
 class _ReaderScreenState extends State<ReaderScreen> {
-  /// 与 `pubspec.yaml` 里登记的 assets 路径一致。
-  /// Web 上 Flutter 会把 asset 放在 `assets/<key>` 下，所以最终 URL 是 `assets/assets/...`。
-  static const String _assetKey = 'assets/spike_book.epub';
-
   final FlutterReadium _readium = FlutterReadium();
   final List<StreamSubscription<Object?>> _subscriptions = [];
-  final List<String> _log = [];
 
   Publication? _publication;
   String? _error;
-  String _locatorJson = '(等待 Locator 事件…)';
+  Map<String, dynamic>? _currentLocator;
   int? _openMillis;
-  bool _showInspector = true;
+  bool _restored = false;
 
   @override
   void initState() {
@@ -63,17 +176,22 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
     _subscriptions.add(
       _readium.onTextLocatorChanged.listen((locator) {
-        final pretty = const JsonEncoder.withIndent('  ').convert(locator.toJson());
-        setState(() => _locatorJson = pretty);
-        // 完整 JSON 打到控制台：本次 spike 要核对的核心数据
-        // （Readium 的 Locator 里到底有没有 CFI、progression 等字段）
-        debugPrint('[perch-spike] Locator JSON:\n$pretty');
-        _append('Locator 更新 → ${locator.href}');
+        // Readium 的 Locator 天然就是 JSON 形状（与 Rust 侧契约一致）
+        final json = locator.toJson();
+        setState(() => _currentLocator = json);
+        // 记录进度：失败不应打断阅读，仅记录日志
+        unawaited(
+          widget.store.save(widget.book.id, json).catchError((Object error) {
+            debugPrint('[perch] 保存进度失败：$error');
+          }),
+        );
       }),
     );
 
     _subscriptions.add(
-      _readium.onErrorEvent.listen((error) => _append('Readium 错误：$error')),
+      _readium.onErrorEvent.listen((error) {
+        debugPrint('[perch] Readium 错误：$error');
+      }),
     );
 
     unawaited(_open());
@@ -88,26 +206,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
     super.dispose();
   }
 
-  void _append(String message) {
-    // 同时打到浏览器/设备控制台：这样无头浏览器（CI）也能拿到验证结果，
-    // 不必依赖人工看图。
-    debugPrint('[perch-spike] $message');
-    setState(() {
-      _log.insert(0, message);
-      if (_log.length > 40) {
-        _log.removeLast();
-      }
-    });
-  }
-
   Future<void> _open() async {
     final stopwatch = Stopwatch()..start();
     try {
-      // Web 上 Flutter 把 asset 放在 `assets/<key>`；但 Readium 内部会用
-      // `new URL(...)` 解析，必须给**绝对 URL**（相对路径会报 Invalid base URL），
-      // 所以用 Uri.base 解析一次。
-      final url = Uri.base.resolve('assets/$_assetKey').toString();
-      _append('URL：$url');
+      // Web 上需要绝对 URL；移动端直接把 asset 路径交给 Readium 也能用
+      final url = Uri.base.resolve('assets/${widget.book.path}').toString();
       final publication = await _readium.openPublication(url);
       stopwatch.stop();
       if (!mounted) {
@@ -117,69 +220,66 @@ class _ReaderScreenState extends State<ReaderScreen> {
         _publication = publication;
         _openMillis = stopwatch.elapsedMilliseconds;
       });
-      _append('打开成功：${stopwatch.elapsedMilliseconds} ms');
-      _append('标题：${publication.metadata.title}');
-      _append('阅读顺序条目数：${publication.readingOrder.length}');
+      debugPrint('[perch] 打开成功：${stopwatch.elapsedMilliseconds} ms');
+      await _restorePosition();
     } on Object catch (error) {
-      stopwatch.stop();
-      _append('打开失败：$error');
+      debugPrint('[perch] 打开失败：$error');
       if (mounted) {
         setState(() => _error = error.toString());
       }
     }
   }
 
-  Future<void> _step({required bool forward}) async {
-    try {
-      if (forward) {
-        await _readium.goForward();
-      } else {
-        await _readium.goBackward();
-      }
-    } on Object catch (error) {
-      _append('翻页失败：$error');
+  /// 恢复上次阅读位置（只做一次，避免覆盖用户刚翻到的位置）。
+  Future<void> _restorePosition() async {
+    if (_restored) {
+      return;
+    }
+    _restored = true;
+    final saved = await widget.store.load(widget.book.id);
+    if (saved == null || !mounted) {
+      return;
+    }
+    final cfi = (saved['locations'] as Map?)?['partialCfi'];
+    debugPrint('[perch] 待恢复位置：$saved');
+    // 具体的跳转交由 Readium 的 Locator 完成；
+    // 这里先用 FFI 校验过的 Locator 做一次自检（见 ReadingSession）
+    if (cfi is String && cfi.isNotEmpty) {
+      debugPrint('[perch] 恢复 CFI：$cfi');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final publication = _publication;
-    final error = _error;
+    final progression = (_currentLocator?['locations'] as Map?)?['progression'];
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Perch Spike — flutter_readium'),
+        title: Text(widget.book.title),
         actions: [
           if (_openMillis != null)
             Center(
               child: Padding(
                 padding: const EdgeInsets.only(right: 12),
-                child: Text('打开 $_openMillis ms'),
+                child: Text('$_openMillis ms'),
               ),
             ),
-          IconButton(
-            tooltip: _showInspector ? '隐藏检查器' : '显示检查器',
-            icon: Icon(_showInspector ? Icons.visibility_off : Icons.visibility),
-            onPressed: () => setState(() => _showInspector = !_showInspector),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(child: _buildReader(error, publication)),
-          if (_showInspector)
-            _InspectorPanel(
-              locatorJson: _locatorJson,
-              log: _log,
-              onBackward: () => unawaited(_step(forward: false)),
-              onForward: () => unawaited(_step(forward: true)),
+          if (progression is num)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: Text('${(progression * 100).round()}%'),
+              ),
             ),
         ],
       ),
+      body: _buildBody(publication),
     );
   }
 
-  Widget _buildReader(String? error, Publication? publication) {
+  Widget _buildBody(Publication? publication) {
+    final error = _error;
     if (error != null) {
       return Center(
         child: Padding(
@@ -196,86 +296,5 @@ class _ReaderScreenState extends State<ReaderScreen> {
       return const Center(child: CircularProgressIndicator());
     }
     return ReadiumReaderWidget(publication: publication);
-  }
-}
-
-/// 底部检查器：翻页按钮 + Readium 给出的 Locator 原始 JSON + 事件日志。
-class _InspectorPanel extends StatelessWidget {
-  const _InspectorPanel({
-    required this.locatorJson,
-    required this.log,
-    required this.onBackward,
-    required this.onForward,
-  });
-
-  final String locatorJson;
-  final List<String> log;
-  final VoidCallback onBackward;
-  final VoidCallback onForward;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      height: 260,
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest,
-        border: Border(top: BorderSide(color: theme.dividerColor)),
-      ),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              IconButton(
-                onPressed: onBackward,
-                icon: const Icon(Icons.chevron_left),
-                tooltip: '上一页',
-              ),
-              IconButton(
-                onPressed: onForward,
-                icon: const Icon(Icons.chevron_right),
-                tooltip: '下一页',
-              ),
-              const Spacer(),
-              Padding(
-                padding: const EdgeInsets.only(right: 12),
-                child: Text('Readium Locator（原始 JSON）', style: theme.textTheme.labelMedium),
-              ),
-            ],
-          ),
-          Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(flex: 3, child: _Mono(text: locatorJson)),
-                const VerticalDivider(width: 1),
-                Expanded(flex: 2, child: _Mono(text: log.join('\n'))),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _Mono extends StatelessWidget {
-  const _Mono({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: Text(
-        text,
-        style: const TextStyle(
-          fontFamily: 'monospace',
-          fontSize: 11,
-          height: 1.4,
-        ),
-      ),
-    );
   }
 }

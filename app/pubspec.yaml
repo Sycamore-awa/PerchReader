@@ -40,6 +40,7 @@ dependencies:
   # 核心绑定层（纯 Dart 包，不依赖 Flutter，便于独立测试）
   perch_core:
     path: ../dart/perch_core
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:

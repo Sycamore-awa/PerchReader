@@ -74,6 +74,10 @@ ffi-smoke: core-lib
 # Dart 静态分析
 # 注意：这里用 dart analyze 而不是 flutter analyze —— 后者在含中文的项目路径下会
 # 抛 FormatException（LSP 通道按字节/字符算错 Content-Length），见 docs/03 环境怪癖
+# Flutter 单元测试（纯 Dart VM，不需设备）
+app-test:
+    cd app && flutter test
+
 app-analyze:
     cd app && dart analyze
 
