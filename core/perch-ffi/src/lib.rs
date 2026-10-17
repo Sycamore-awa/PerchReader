@@ -43,6 +43,73 @@ use serde_json::{Value, json};
 /// 业务版本号，供 Dart 侧做兼容性断言。
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 同时最多允许打开多少本书的索引。
+///
+/// 手机上不能无限开：每个索引都持有整本正文（[`perch_jobs::BookText`]）+
+/// 倒排表。取 8 是为了"书架 + 阅读器 + 搜索面板"这类场景够用，
+/// 同时把最坏内存占用兜住。
+const MAX_OPEN_BOOKS: usize = 8;
+
+/// 一次搜索默认最多返回多少条。
+///
+/// 搜索面板一次也展示不了更多；上限小一点也能让大书上的单次调用更快。
+const DEFAULT_SEARCH_LIMIT: usize = 50;
+
+/// 一本书的已打开状态：正文 + 章节目录 + 倒排索引。
+struct OpenBook {
+    text: perch_jobs::BookText,
+    index: perch_index::Index,
+}
+
+/// 有状态对象的句柄表。
+///
+/// Dart 侧拿到的是 `u64` 句柄；真正的 Rust 对象留在这里。
+/// **句柄自增且永不复用**——这样"关掉之后又拿旧句柄调用"会得到
+/// `BOOK_BAD_HANDLE`，而不是误操作到另一个对象上。
+#[derive(Default)]
+struct Registry {
+    next: u64,
+    open: std::collections::HashMap<u64, OpenBook>,
+}
+
+static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
+
+/// 借用句柄表。
+///
+/// 互斥锁中毒时用 `into_inner()` 继续——`Registry` 里没有会被破坏的不变量，
+/// 为了"一次 panic"就让后续所有调用永久失败不值得。
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    let mutex = REGISTRY.get_or_init(|| std::sync::Mutex::new(Registry::default()));
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl Registry {
+    fn insert(&mut self, book: OpenBook) -> Result<u64, FfiError> {
+        if self.open.len() >= MAX_OPEN_BOOKS {
+            return Err(FfiError::new(
+                "BOOK_TOO_MANY_OPEN",
+                format!("同时最多打开 {MAX_OPEN_BOOKS} 本书，请先 close"),
+            ));
+        }
+        let handle = self.next;
+        self.next = self.next.saturating_add(1);
+        self.open.insert(handle, book);
+        Ok(handle)
+    }
+
+    fn get(&self, handle: u64) -> Result<&OpenBook, FfiError> {
+        self.open.get(&handle).ok_or_else(|| {
+            FfiError::new(
+                "BOOK_BAD_HANDLE",
+                format!("句柄 {handle} 不存在（可能已 close 或从未 open）"),
+            )
+        })
+    }
+}
+
 /// 统一错误对象。
 #[derive(Debug)]
 struct FfiError {
@@ -126,6 +193,66 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
                 perch_jobs::refine_epub(&bytes, perch_jobs::ExtractOptions { max_chars })
                     .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
             serde_json::to_value(&refinement).map_err(|error| FfiError::bad_args(error.to_string()))
+        }
+
+        // 打开一本书：抽正文 + 建索引，返回句柄。后续搜索复用这个索引。
+        "book.open" => {
+            let bytes = hex_to_bytes(required_str(&args, "bytes_hex")?)?;
+            let chunk_chars = args
+                .get("chunk_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(perch_index::DEFAULT_CHUNK_CHARS);
+            let text = perch_jobs::extract_epub_text(&bytes, perch_jobs::ExtractOptions::default())
+                .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
+            let index = perch_jobs::index_book(&text, chunk_chars);
+            let stats = index.stats();
+            let char_count = text.char_count();
+            let chapter_count = text.chapters.len();
+            let truncated = text.truncated;
+            let handle = registry().insert(OpenBook { text, index })?;
+            Ok(json!({
+                "handle": handle,
+                "charCount": char_count,
+                "chapterCount": chapter_count,
+                "chunks": stats.chunks,
+                "tokens": stats.tokens,
+                "truncated": truncated,
+            }))
+        }
+
+        // 在已打开的索引里检索；命中会还原成粗定位 Locator。
+        "book.search" => {
+            let handle = required_u64(&args, "handle")?;
+            let query = required_str(&args, "query")?;
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(DEFAULT_SEARCH_LIMIT, |n| n as usize);
+            let guard = registry();
+            let book = guard.get(handle)?;
+            let hits: Vec<Value> = book
+                .index
+                .search(query)
+                .into_iter()
+                .take(limit)
+                .map(|hit| {
+                    let locator = perch_jobs::locate_hit(&book.text, &hit);
+                    json!({
+                        "charStart": hit.char_start,
+                        "charEnd": hit.char_end,
+                        "snippet": hit.snippet,
+                        "locator": locator,
+                    })
+                })
+                .collect();
+            Ok(json!({ "hits": hits }))
+        }
+
+        // 释放一本书的索引。
+        "book.close" => {
+            let handle = required_u64(&args, "handle")?;
+            let removed = registry().open.remove(&handle).is_some();
+            Ok(json!({ "closed": removed }))
         }
 
         // ---- PDF（perch-pdf）----
@@ -280,6 +407,13 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             format!("未知方法: {other}"),
         )),
     }
+}
+
+/// 取一个必填的无符号整数字段。
+fn required_u64(args: &Value, field: &str) -> Result<u64, FfiError> {
+    args.get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| FfiError::bad_args(format!("缺少或非法的 {field}")))
 }
 
 /// 从入参里取一个变更数组（字段缺省视为空数组）。
@@ -717,6 +851,110 @@ mod tests {
         let args = json!({ "bytes_hex": hex(b"not a zip at all") }).to_string();
         let out = dispatch("jobs.refine", &args);
         assert_eq!(out["error"]["code"], "JOBS_EPUB");
+    }
+
+    // ---------- 句柄表：打开 / 搜索 / 关闭 ----------
+
+    fn open_book() -> u64 {
+        let args = json!({ "bytes_hex": hex(&epub_fixture()) }).to_string();
+        let out = dispatch("book.open", &args);
+        out["handle"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("book.open 失败: {out}"))
+    }
+
+    #[test]
+    fn book_open_reports_index_stats() {
+        let handle = open_book();
+        let args = json!({ "bytes_hex": hex(&epub_fixture()) }).to_string();
+        let out = dispatch("book.open", &args);
+        assert!(out["charCount"].as_u64().unwrap() > 0);
+        assert_eq!(out["chapterCount"], 1);
+        assert!(out["chunks"].as_u64().unwrap() >= 1);
+        assert_eq!(out["truncated"], false);
+        // 两次 open 拿到不同句柄
+        let second = out["handle"].as_u64().unwrap();
+        assert_ne!(handle, second);
+        dispatch("book.close", &json!({ "handle": handle }).to_string());
+        dispatch("book.close", &json!({ "handle": second }).to_string());
+    }
+
+    #[test]
+    fn book_search_returns_locator_pointing_at_the_chapter() {
+        let handle = open_book();
+        let args = json!({ "handle": handle, "query": "春天的花开" }).to_string();
+        let out = dispatch("book.search", &args);
+        let hits = out["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "应当命中 1 条");
+        let locator = &hits[0]["locator"];
+        assert_eq!(locator["href"], "/OEBPS/chap0.xhtml");
+        assert_eq!(locator["perch"]["format"], "epub");
+        assert!(locator["locations"]["progression"].as_f64().is_some());
+        // 粗定位：不给 CFI，精确位置由阅读器按文本重锚定
+        assert!(locator["locations"].get("partialCfi").is_none());
+        dispatch("book.close", &json!({ "handle": handle }).to_string());
+    }
+
+    #[test]
+    fn book_search_miss_returns_empty() {
+        let handle = open_book();
+        let args = json!({ "handle": handle, "query": "完全不存在的词" }).to_string();
+        let out = dispatch("book.search", &args);
+        assert_eq!(out["hits"].as_array().unwrap().len(), 0);
+        dispatch("book.close", &json!({ "handle": handle }).to_string());
+    }
+
+    #[test]
+    fn closed_handle_is_rejected_not_misused() {
+        let handle = open_book();
+        let closed = dispatch("book.close", &json!({ "handle": handle }).to_string());
+        assert_eq!(closed["closed"], true);
+        // 再关一次是幂等的，不报错
+        let again = dispatch("book.close", &json!({ "handle": handle }).to_string());
+        assert_eq!(again["closed"], false);
+        // 但用旧句柄搜索必须报错，而不是操作到别的书上
+        let args = json!({ "handle": handle, "query": "春天" }).to_string();
+        let out = dispatch("book.search", &args);
+        assert_eq!(out["error"]["code"], "BOOK_BAD_HANDLE");
+    }
+
+    #[test]
+    fn unknown_handle_is_rejected() {
+        let args = json!({ "handle": 999_999, "query": "x" }).to_string();
+        let out = dispatch("book.search", &args);
+        assert_eq!(out["error"]["code"], "BOOK_BAD_HANDLE");
+    }
+
+    #[test]
+    fn missing_handle_is_bad_args() {
+        let out = dispatch("book.search", r#"{"query":"x"}"#);
+        assert_eq!(out["error"]["code"], "FFI_BAD_ARGS");
+    }
+
+    #[test]
+    fn registry_enforces_open_book_limit() {
+        // 直接测 Registry 本身，不碰全局单例——否则会和并行跑的其他测试抢名额
+        let mut local = Registry::default();
+        let mut handles = Vec::new();
+        for _ in 0..MAX_OPEN_BOOKS {
+            let book = perch_jobs::extract_epub_text(
+                &epub_fixture(),
+                perch_jobs::ExtractOptions::default(),
+            )
+            .unwrap();
+            let index = perch_jobs::index_book(&book, 64);
+            handles.push(local.insert(OpenBook { text: book, index }).unwrap());
+        }
+        let book =
+            perch_jobs::extract_epub_text(&epub_fixture(), perch_jobs::ExtractOptions::default())
+                .unwrap();
+        let index = perch_jobs::index_book(&book, 64);
+        let error = local.insert(OpenBook { text: book, index }).unwrap_err();
+        assert_eq!(error.code, "BOOK_TOO_MANY_OPEN");
+
+        // 句柄互不相同且单调（永不复用）
+        assert_eq!(handles.len(), MAX_OPEN_BOOKS);
+        assert!(handles.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     // ---------- PDF 结构 ----------

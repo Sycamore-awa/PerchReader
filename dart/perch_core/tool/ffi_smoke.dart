@@ -16,6 +16,8 @@ import 'dart:io';
 
 import 'package:perch_core/perch_core.dart';
 
+import 'fixtures.dart';
+
 int _passed = 0;
 int _failed = 0;
 
@@ -235,13 +237,7 @@ void main(List<String> args) {
   stdout.writeln('[10] PDF 结构解析');
   // 一份 441 字节的最小 PDF（1 页，Title=Sample），由 lopdf 生成后固化在此。
   // 固化的好处：测试不依赖「生成器」与「解析器」同源，避免互相掩盖错误。
-  const samplePdfHex =
-      '255044462d312e370a25bbadc0de0a312030206f626a0a3c3c2f547970652f50616765732f4b6964735b33203020525d2f436f756e7420313e3e0a656e646f626a0a322030206f626a0a3c3c2f4c656e67746820303e3e73747265616d0a0a656e6473747265616d200a656e646f626a0a332030206f626a0a3c3c2f547970652f506167652f506172656e742031203020522f4d65646961426f785b30203020353935203834325d2f436f6e74656e74732032203020523e3e0a656e646f626a0a342030206f626a0a3c3c2f5469746c652853616d706c65293e3e0a656e646f626a0a352030206f626a0a3c3c2f547970652f436174616c6f672f50616765732031203020523e3e0a656e646f626a0a362030206f626a0a3c3c2f496e666f2034203020522f526f6f742035203020522f547970652f585265662f53697a6520372f575b31203420325d2f496e6465785b3120365d2f4c656e6774682034323e3e73747265616d0a010000000f0000010000004200000100000071000001000000c1000001000000e30000010000011000000a656e6473747265616d200a656e646f626a0a0a7374617274787265660a3237320a2525454f46';
-  final samplePdf = <int>[];
-  for (var i = 0; i < samplePdfHex.length; i += 2) {
-    samplePdf.add(int.parse(samplePdfHex.substring(i, i + 2), radix: 16));
-  }
-  final pdf = core.analyzePdf(samplePdf);
+  final pdf = core.analyzePdf(hexBytes(samplePdfHex));
   check('PDF 页数', pdf['pageCount'], 1);
   check('PDF 版本', pdf['version'], '1.7');
   check('PDF 标题', pdf['title'], 'Sample');
@@ -266,6 +262,36 @@ void main(List<String> args) {
     checkTrue('非 EPUB 应当报错', false, '没有抛异常');
   } on PerchCoreException catch (error) {
     check('非 EPUB 的错误码', error.code, 'JOBS_EPUB');
+  }
+
+  // ---- 12) 句柄表：打开一本书 → 搜索 → 关闭 ----
+  stdout.writeln('[12] 句柄表（有状态索引）');
+  final opened = core.openBook(hexBytes(sampleEpubHex));
+  final handle = opened['handle'] as int;
+  checkTrue('拿到句柄', handle >= 0, 'handle=$handle');
+  check('章节目录数', opened['chapterCount'], 1);
+  checkTrue(
+    '正文字符数大于 0',
+    (opened['charCount'] as num) > 0,
+    'charCount=${opened['charCount']}',
+  );
+
+  // 搜索命中要能还原成指向正确章节的 Locator
+  final found = core.searchBook(handle: handle, query: '春天的花开');
+  final bookHits = found['hits'] as List;
+  check('搜索命中数', bookHits.length, 1);
+  final locator = (bookHits.first as Map)['locator'] as Map;
+  check('命中所在章节', locator['href'], '/OEBPS/chap0.xhtml');
+  check('Locator 带 epub 格式', (locator['perch'] as Map)['format'], 'epub');
+
+  // 关闭之后旧句柄必须被拒绝，而不是误操作到别的书上
+  final closed = core.closeBook(handle);
+  check('关闭成功', closed['closed'], true);
+  try {
+    core.searchBook(handle: handle, query: '春天');
+    checkTrue('关闭后搜索应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('关闭后的错误码', error.code, 'BOOK_BAD_HANDLE');
   }
 
   // ---- 汇总 ----

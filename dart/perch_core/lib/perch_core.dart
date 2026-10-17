@@ -170,6 +170,35 @@ class PerchCore {
     return (result['hits'] as List).cast<Map<String, dynamic>>();
   }
 
+  /// 打开一本书：抽正文 + 建索引，返回句柄。
+  ///
+  /// 索引是有状态的重对象，句柄由本包托管：**用完必须 [closeBook]**。
+  /// 同时最多打开 8 本，超出会报 `BOOK_TOO_MANY_OPEN`。
+  Map<String, dynamic> openBook(List<int> bytes, {int? chunkChars}) =>
+      invoke('book.open', {
+        'bytes_hex': _hex(bytes),
+        if (chunkChars != null) 'chunk_chars': chunkChars,
+      });
+
+  /// 在已打开的索引里检索。
+  ///
+  /// 每条命中带一个**粗定位** `locator`（章节 href + 全书进度 + 命中原文）：
+  /// 精确位置需要阅读器在该章内按文本重锚定（见 `docs/02` §五）。
+  Map<String, dynamic> searchBook({
+    required int handle,
+    required String query,
+    int? limit,
+  }) =>
+      invoke('book.search', {
+        'handle': handle,
+        'query': query,
+        if (limit != null) 'limit': limit,
+      });
+
+  /// 关闭一本书的索引并释放内存。对已关闭的句柄调用是安全的（返回 false）。
+  Map<String, dynamic> closeBook(int handle) =>
+      invoke('book.close', {'handle': handle});
+
   /// 阶段②精修：解析 EPUB 的元数据 / 封面 / 目录 / 字数。
   ///
   /// 返回 `{title?, author?, language?, coverHref?, toc, spineCount, charCount}`。
