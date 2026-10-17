@@ -375,6 +375,13 @@ packages:
       relative: true
     source: path
     version: "0.1.0"
+  perch_core_ffi:
+    dependency: "direct main"
+    description:
+      path: "../plugins/perch_core_ffi"
+      relative: true
+    source: path
+    version: "0.1.0"
   petitparser:
     dependency: transitive
     description:

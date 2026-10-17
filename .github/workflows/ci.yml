@@ -174,6 +174,14 @@ jobs:
           echo "===== CocoaPods ====="
           pod --version || echo "未安装 CocoaPods"
 
+      # Rust 工具链：flutter build 期间，podspec 的 script_phase 会调用 cargo。
+      # core/rust-toolchain.toml 已声明 3 个 iOS target，rustup 会自动补齐。
+      - name: 安装 rustup（供 podspec 的构建阶段调用 cargo）
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: 安装 Flutter
         run: |
           # 用 git 拉 stable 分支，避免依赖第三方 action
@@ -220,6 +228,29 @@ jobs:
           set -o pipefail
           # 模拟器构建不涉及签名，因此 CI 里可跑
           flutter build ios --simulator 2>&1 | tail -200
+
+      # 关键断言：`-force_load` 是否真的把 Rust 符号链进了最终二进制。
+      # 编译通过 ≠ 符号在里面 —— 没有 -force_load 时链接器会把没人引用的
+      # 静态库内容当死代码丢掉，而 App 依然"编译成功"，直到运行时
+      # DynamicLibrary.process() 才报符号找不到。
+      - name: 断言 Rust 符号已链入 App 二进制
+        run: |
+          set -o pipefail
+          binary=$(find app/build/ios/iphonesimulator -maxdepth 2 -name Runner -type f | head -1)
+          if [ -z "$binary" ]; then
+            echo "::error::找不到 Runner 可执行文件"
+            exit 1
+          fi
+          echo "检查：$binary"
+          # 先取整张符号表再比较（不要 nm | grep -q：见 docs/03 §九）
+          symbols=$(nm -g "$binary" 2>/dev/null || true)
+          for symbol in _perch_call _perch_string_free; do
+            if ! grep -q "T $symbol$" <<<"$symbols"; then
+              echo "::error::$symbol 不在 App 二进制里 —— -force_load 没生效"
+              exit 1
+            fi
+            echo "✓ $symbol 已链入 App"
+          done
 
       - name: 汇总
         if: always()

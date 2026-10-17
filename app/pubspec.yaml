@@ -40,6 +40,9 @@ dependencies:
   # 核心绑定层（纯 Dart 包，不依赖 Flutter，便于独立测试）
   perch_core:
     path: ../dart/perch_core
+  # 把 Rust 核心静态链接进 iOS App（-force_load）
+  perch_core_ffi:
+    path: ../plugins/perch_core_ffi
   path_provider: ^2.1.6
 
 dev_dependencies:
