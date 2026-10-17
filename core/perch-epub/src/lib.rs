@@ -16,18 +16,20 @@
 //!
 //! # 尚未实现（下一步）
 //!
+//! - CFI 范围定位的"相对路径 → 绝对路径"展开（点定位已可用，见 [`cfi`]）
 //! - 目录（TOC）：EPUB3 的 NAV 文档与 EPUB2 的 NCX
-//! - CFI 生成与解析（`(href, 字节偏移) ↔ CFI` 双向换算）
 //! - 全文抽取（供索引使用）
 
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod cfi;
 pub mod error;
 pub mod package;
 mod xml;
 
 pub use archive::EpubArchive;
+pub use cfi::{Cfi, CfiError, CfiPath, Step};
 pub use error::EpubError;
 pub use package::{ManifestItem, Metadata, Package, SpineItem, resolve_href};
 
