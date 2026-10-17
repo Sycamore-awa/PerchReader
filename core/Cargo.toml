@@ -1,6 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync", "perch-import", "perch-ffi"]
+members = [
+    "perch-model",
+    "perch-epub",
+    "perch-txt",
+    "perch-pagecurl",
+    "perch-index",
+    "perch-sync",
+    "perch-import",
+    "perch-pipeline",
+    "perch-ffi",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +30,7 @@ perch-index = { path = "perch-index" }
 perch-pagecurl = { path = "perch-pagecurl" }
 perch-sync = { path = "perch-sync" }
 perch-import = { path = "perch-import" }
+perch-pipeline = { path = "perch-pipeline" }
 # ZIP：只用纯 Rust 的 deflate（miniz_oxide），保证可为 iOS 交叉编译
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # XML：纯 Rust，流式解析，适合较大的 OPF / NCX

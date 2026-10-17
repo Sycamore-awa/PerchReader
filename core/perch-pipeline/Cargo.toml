@@ -1,0 +1,13 @@
+[package]
+name = "perch-pipeline"
+description = "导入管线阶段②③的调度：优先级队列、并发上限、失败退避、崩溃后恢复（纯逻辑，可注入时钟）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

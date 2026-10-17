@@ -277,6 +277,14 @@ name = "perch-pagecurl"
 version = "0.1.0"
 
 [[package]]
+name = "perch-pipeline"
+version = "0.1.0"
+dependencies = [
+ "perch-model",
+ "thiserror",
+]
+
+[[package]]
 name = "perch-sync"
 version = "0.1.0"
 dependencies = [
