@@ -52,6 +52,10 @@ pub enum CfiError {
     #[error("CFI 分段为空")]
     EmptyPart,
 
+    /// 期望单条路径，但输入含逗号分隔的多段。
+    #[error("期望单条路径，但输入包含多段")]
+    MultipleParts,
+
     /// `epubcfi(` 没有对应的 `)`。
     #[error("epubcfi( 缺少闭合的 )")]
     UnclosedWrapper,
@@ -96,6 +100,7 @@ impl CfiError {
         match self {
             Self::Empty => "CFI_EMPTY",
             Self::EmptyPart => "CFI_EMPTY_PART",
+            Self::MultipleParts => "CFI_MULTIPLE_PARTS",
             Self::UnclosedWrapper => "CFI_UNCLOSED_WRAPPER",
             Self::UnbalancedBrackets => "CFI_UNBALANCED_BRACKETS",
             Self::InvalidAssertion(_) => "CFI_INVALID_ASSERTION",
@@ -192,6 +197,24 @@ impl CfiPath {
             indirection,
             local,
             text_offset,
+        }
+    }
+
+    /// 解析单条路径（不含 `epubcfi()` 包裹，也不含逗号分隔的多段）。
+    ///
+    /// 与 [`Cfi::parse`] 的区别：这里要求输入恰好是一条路径。
+    ///
+    /// # Errors
+    ///
+    /// 路径非法，或输入含多段时返回 [`CfiError::MultipleParts`]。
+    pub fn parse(input: &str) -> Result<Self, CfiError> {
+        let mut parts = Cfi::parse(input)?.parts;
+        if parts.len() != 1 {
+            return Err(CfiError::MultipleParts);
+        }
+        match parts.pop() {
+            Some(path) => Ok(path),
+            None => Err(CfiError::Empty),
         }
     }
 

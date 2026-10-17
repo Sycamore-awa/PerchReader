@@ -26,12 +26,14 @@ pub mod archive;
 pub mod cfi;
 pub mod error;
 pub mod package;
+pub mod xhtml;
 mod xml;
 
 pub use archive::EpubArchive;
 pub use cfi::{Cfi, CfiError, CfiPath, Step};
 pub use error::EpubError;
 pub use package::{ManifestItem, Metadata, Package, SpineItem, resolve_href};
+pub use xhtml::{Located, TextNode, XhtmlError, XhtmlIndex};
 
 #[cfg(test)]
 pub(crate) mod test_fixture;
