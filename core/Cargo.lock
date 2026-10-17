@@ -491,6 +491,7 @@ dependencies = [
  "perch-epub",
  "perch-index",
  "perch-model",
+ "perch-pipeline",
  "serde",
  "thiserror",
  "zip",

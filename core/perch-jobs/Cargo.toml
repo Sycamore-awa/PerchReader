@@ -9,6 +9,7 @@ rust-version.workspace = true
 perch-model.workspace = true
 perch-epub.workspace = true
 perch-index.workspace = true
+perch-pipeline.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

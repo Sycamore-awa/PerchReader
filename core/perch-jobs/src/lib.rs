@@ -34,6 +34,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pipeline;
+
+pub use pipeline::{BookStore, Pipeline, StepOutcome, StepSummary};
+
 use perch_epub::{
     EpubArchive, EpubError, Package, TocEntry, XhtmlIndex, flatten_toc, parse_nav, parse_ncx,
 };
@@ -446,7 +450,7 @@ mod tests {
     /// 造一个最小 EPUB。
     ///
     /// `chapters` 是每章的正文段落；`with_nav` 控制是否带 EPUB3 目录。
-    fn build_epub(chapters: &[&str], with_nav: bool, with_cover: bool) -> Vec<u8> {
+    pub(crate) fn build_epub(chapters: &[&str], with_nav: bool, with_cover: bool) -> Vec<u8> {
         let mut buffer = Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut buffer);
