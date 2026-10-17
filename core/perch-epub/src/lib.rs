@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anchor;
 pub mod archive;
 pub mod cfi;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod toc;
 pub mod xhtml;
 mod xml;
 
+pub use anchor::{AnchorQuery, Anchored, MIN_CONFIDENCE, reanchor};
 pub use archive::EpubArchive;
 pub use cfi::{Cfi, CfiError, CfiPath, Step};
 pub use error::EpubError;
