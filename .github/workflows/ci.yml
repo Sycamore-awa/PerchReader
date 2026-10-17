@@ -20,6 +20,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 同一分支只保留最新一次运行：新推送会取消排队中的旧 run。
+# 这既能省 macOS 分钟数，也能把"卡在 queued 的僵尸 run"顺手清掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -79,7 +85,10 @@ jobs:
   ios-macos:
     name: iOS 编译（macOS runner + Xcode）
     needs: core-linux
-    runs-on: macos-26-arm64
+    # 标签必须用官方列表里的名字：macOS 26 的 arm64 镜像标签就是 `macos-26`
+    # （或 `macos-latest` / `macos-26-xlarge`）。**没有** `macos-26-arm64` 这个标签——
+    # 写成本来不存在的标签，job 会永远 queued 而不会报错，非常难察觉。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
