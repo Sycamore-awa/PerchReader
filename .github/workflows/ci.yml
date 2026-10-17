@@ -242,11 +242,18 @@ jobs:
             exit 1
           fi
           echo "检查：$binary"
+          ls -la "$binary"
+
           # 先取整张符号表再比较（不要 nm | grep -q：见 docs/03 §九）
-          symbols=$(nm -g "$binary" 2>/dev/null || true)
+          symbols=$(nm "$binary" 2>/dev/null || true)
+          echo "--- 符号表里所有 perch 相关条目（自诊断用）---"
+          grep -i perch <<<"$symbols" || echo "（一条都没有）"
+          echo "--- 符号总数 ---"
+          wc -l <<<"$symbols"
+
           for symbol in _perch_call _perch_string_free; do
-            if ! grep -q "T $symbol$" <<<"$symbols"; then
-              echo "::error::$symbol 不在 App 二进制里 —— -force_load 没生效"
+            if ! grep -qE "^[0-9a-f]+ [Tt] $symbol$" <<<"$symbols"; then
+              echo "::error::$symbol 不在 App 二进制里 —— 静态库没有被链入"
               exit 1
             fi
             echo "✓ $symbol 已链入 App"
