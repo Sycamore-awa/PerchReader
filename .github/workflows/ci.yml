@@ -235,34 +235,70 @@ jobs:
       # DynamicLibrary.process() 才报符号找不到。
       - name: 断言 Rust 符号已链入 App 二进制
         run: |
-          set -o pipefail
-          # 注意 `| head -1`：head 提前关管道会让 find 收到 SIGPIPE，
-          # 在 pipefail + bash -e 下赋值语句直接失败——诊断一行都打不出来。
-          # 加 `|| true` 兜住。（同类坑见 docs/03 §九 的 grep -q 案例）
-          binary=$(find app/build/ios/iphonesimulator -maxdepth 2 -name Runner -type f 2>/dev/null | head -1 || true)
-          if [ -z "$binary" ]; then
-            echo "::error::找不到 Runner 可执行文件"
+          set -uo pipefail
+          # ⚠️ 本步骤禁止「消费端提前退出」的管道（grep -q / head / sed q）：
+          # 生产者会收 SIGPIPE，在 pipefail + bash -e 下整步静默失败，
+          # **一行诊断都打不出来**。这个坑已经踩了 4 次（docs/10 §6.2）。
+          # 诊断一律 echo 到 stdout —— `gh run view <id> --log` 可读。
+          binary="app/build/ios/iphonesimulator/Runner.app/Runner"
+          if [ ! -f "$binary" ]; then
+            echo "::error::找不到 $binary"
+            ls -la app/build/ios/ 2>/dev/null || true
             exit 1
           fi
 
-          # 诊断信息通过 ::error:: 注解输出，便于在不下载日志的情况下定位问题
-          # （Actions 日志接口需要认证，而 annotations 接口是公开的）
-          symbols=$(nm "$binary" 2>/dev/null || true)
-          total=$(wc -l <<<"$symbols" | tr -d ' ')
-          anchor=$(grep -c '_perch_link_anchor' <<<"$symbols" || true)
-          perch=$(grep -i 'perch' <<<"$symbols" | head -6 | tr '\n' '|')
+          symbols=$(nm "$binary" 2>&1 || true)
 
-          diag="binary=$binary 总符号=$total 锚点命中=$anchor perch行=[$perch]"
+          echo "======== 符号断言诊断 ========"
+          echo "二进制: $binary"
+          echo "字节数: $(wc -c < "$binary" | tr -d ' ')"
+          echo "符号数: $(wc -l <<<"$symbols" | tr -d ' ')"
+          echo "---- 所有含 perch 的符号 ----"
+          if grep -qi 'perch' <<<"$symbols"; then
+            grep -i 'perch' <<<"$symbols"
+          else
+            echo "（没有任何含 perch 的符号）"
+          fi
 
-          # 先取整张符号表再比较（不要 nm | grep -q：见 docs/03 §九）
+          status=0
           for symbol in _perch_call _perch_string_free; do
-            if ! grep -qE "^[0-9a-f]+ [Tt] $symbol$" <<<"$symbols"; then
-              echo "::error::$symbol 不在 App 二进制里 —— $diag"
-              exit 1
+            if grep -qE "^[[:xdigit:]]+ +[A-Za-z] +${symbol}$" <<<"$symbols"; then
+              echo "✓ $symbol 已链入 App"
+            else
+              echo "✗ $symbol 不在 App 二进制的符号表里"
+              status=1
             fi
-            echo "✓ $symbol 已链入 App"
           done
-          echo "✓ 全部符号已链入（$diag）"
+
+          if [ "$status" -ne 0 ]; then
+            echo "======== 失败原因排查 ========"
+            echo "---- ① libperch_ffi.a 本身有符号吗 ----"
+            found_lib=0
+            for lib in app/build/ios/*/libperch_ffi.a; do
+              [ -f "$lib" ] || continue
+              found_lib=1
+              echo "库: $lib"
+              nm "$lib" 2>&1 | grep -E ' _perch_(call|string_free)$' || echo "  （库里也没有！）"
+            done
+            [ "$found_lib" -eq 0 ] && echo "  没找到 libperch_ffi.a —— 构建阶段没产出"
+            echo "---- ② CocoaPods 生成的链接参数里有没有 force_load ----"
+            hit=0
+            for xc in "app/ios/Pods/Target Support Files"/*/*.xcconfig; do
+              [ -f "$xc" ] || continue
+              if grep -q 'force_load' "$xc"; then
+                hit=1
+                echo "命中: $xc"
+                grep 'force_load' "$xc"
+              fi
+            done
+            [ "$hit" -eq 0 ] && echo "  所有 xcconfig 里都没有 force_load —— 参数没传到链接器"
+            echo "---- ③ Runner.app 内容 ----"
+            ls -la app/build/ios/iphonesimulator/Runner.app/ 2>/dev/null || true
+            echo "---- ④ 构建模式（Debug 不剥符号 / Release 会剥）----"
+            ls -d app/build/ios/*/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "======== 断言通过 ========"
 
       - name: 汇总
         if: always()
