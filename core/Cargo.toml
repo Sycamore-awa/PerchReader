@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync", "perch-import"]
+members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync", "perch-import", "perch-ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,12 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 # 内部 crate 互相依赖
 perch-model = { path = "perch-model" }
+perch-epub = { path = "perch-epub" }
+perch-txt = { path = "perch-txt" }
+perch-index = { path = "perch-index" }
+perch-pagecurl = { path = "perch-pagecurl" }
+perch-sync = { path = "perch-sync" }
+perch-import = { path = "perch-import" }
 # ZIP：只用纯 Rust 的 deflate（miniz_oxide），保证可为 iOS 交叉编译
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # XML：纯 Rust，流式解析，适合较大的 OPF / NCX

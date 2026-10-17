@@ -1,0 +1,25 @@
+[package]
+name = "perch-ffi"
+description = "FFI 边界：单一入口 perch_call(method, args_json) -> result_json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# cdylib 供本机/桌面与测试用；staticlib 供 iOS 静态链接
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+perch-model.workspace = true
+perch-epub.workspace = true
+perch-txt.workspace = true
+perch-index.workspace = true
+perch-pagecurl.workspace = true
+perch-sync.workspace = true
+perch-import.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# 刻意**不**继承 workspace lints：
+# 这里是唯一允许 unsafe 的地方（裸指针跨语言边界），
+# 工作区其它 crate 依然被 forbid(unsafe_code) 保护。

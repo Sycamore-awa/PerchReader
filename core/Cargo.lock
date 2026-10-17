@@ -233,6 +233,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "perch-ffi"
+version = "0.1.0"
+dependencies = [
+ "perch-epub",
+ "perch-import",
+ "perch-index",
+ "perch-model",
+ "perch-pagecurl",
+ "perch-sync",
+ "perch-txt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "perch-import"
 version = "0.1.0"
 dependencies = [

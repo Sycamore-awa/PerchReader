@@ -62,6 +62,14 @@ spike-web-setup:
 app-web:
     cd app && flutter build web --release
 
+# 编出本机的核心动态库（供 Dart 侧调用）
+core-lib:
+    cd core && cargo build -p perch-ffi --release
+
+# FFI 端到端冒烟：真的用 Dart 加载 .so 并调用所有 crate（无需设备、无需 Mac）
+ffi-smoke: core-lib
+    cd app && dart run tool/ffi_smoke.dart ../core/target/release/libperch_ffi.so
+
 # Dart 静态分析
 # 注意：这里用 dart analyze 而不是 flutter analyze —— 后者在含中文的项目路径下会
 # 抛 FormatException（LSP 通道按字节/字符算错 Content-Length），见 docs/03 环境怪癖
