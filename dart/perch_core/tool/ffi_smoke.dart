@@ -231,6 +231,34 @@ void main(List<String> args) {
   );
   check('游标之后无增量', (emptyDelta['changes'] as List).length, 0);
 
+  // ---- 10) PDF 结构 ----
+  stdout.writeln('[10] PDF 结构解析');
+  // 一份 441 字节的最小 PDF（1 页，Title=Sample），由 lopdf 生成后固化在此。
+  // 固化的好处：测试不依赖「生成器」与「解析器」同源，避免互相掩盖错误。
+  const samplePdfHex =
+      '255044462d312e370a25bbadc0de0a312030206f626a0a3c3c2f547970652f50616765732f4b6964735b33203020525d2f436f756e7420313e3e0a656e646f626a0a322030206f626a0a3c3c2f4c656e67746820303e3e73747265616d0a0a656e6473747265616d200a656e646f626a0a332030206f626a0a3c3c2f547970652f506167652f506172656e742031203020522f4d65646961426f785b30203020353935203834325d2f436f6e74656e74732032203020523e3e0a656e646f626a0a342030206f626a0a3c3c2f5469746c652853616d706c65293e3e0a656e646f626a0a352030206f626a0a3c3c2f547970652f436174616c6f672f50616765732031203020523e3e0a656e646f626a0a362030206f626a0a3c3c2f496e666f2034203020522f526f6f742035203020522f547970652f585265662f53697a6520372f575b31203420325d2f496e6465785b3120365d2f4c656e6774682034323e3e73747265616d0a010000000f0000010000004200000100000071000001000000c1000001000000e30000010000011000000a656e6473747265616d200a656e646f626a0a0a7374617274787265660a3237320a2525454f46';
+  final samplePdf = <int>[];
+  for (var i = 0; i < samplePdfHex.length; i += 2) {
+    samplePdf.add(int.parse(samplePdfHex.substring(i, i + 2), radix: 16));
+  }
+  final pdf = core.analyzePdf(samplePdf);
+  check('PDF 页数', pdf['pageCount'], 1);
+  check('PDF 版本', pdf['version'], '1.7');
+  check('PDF 标题', pdf['title'], 'Sample');
+  checkTrue(
+    '没有目录时 outline 为空',
+    ((pdf['outline'] as List?) ?? const []).isEmpty,
+    'outline=${pdf['outline']}',
+  );
+
+  // 非 PDF 必须明确拒绝，而不是当成空文档
+  try {
+    core.analyzePdf('not a pdf'.codeUnits);
+    checkTrue('非 PDF 应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('非 PDF 的错误码', error.code, 'PDF_NOT_PDF');
+  }
+
   // ---- 汇总 ----
   stdout.writeln('');
   stdout.writeln('通过 $_passed 项，失败 $_failed 项');

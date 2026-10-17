@@ -1,0 +1,20 @@
+[package]
+name = "perch-pdf"
+description = "PDF 结构解析：页数、大纲、元数据（不渲染、不抽正文）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# PDF 解析：纯 Rust，可为 iOS 交叉编译。
+# 关掉默认特性（chrono-clock / rayon）——我们只需要读结构，
+# 不需要时间格式化，也不需要并行。
+lopdf = { version = "0.45", default-features = false }
+# lopdf 的目录 API 要求传一个 IndexMap，因此需要直接依赖它
+indexmap = "2"
+
+[lints]
+workspace = true

@@ -170,6 +170,13 @@ class PerchCore {
     return (result['hits'] as List).cast<Map<String, dynamic>>();
   }
 
+  /// 解析 PDF 结构（页数 / 大纲 / 元数据）。
+  ///
+  /// 只返回结构信息，**不抽正文、不渲染**：正文走平台注入的 port。
+  /// 返回 `{pageCount, version, title?, author?, subject?, producer?, outline?}`。
+  Map<String, dynamic> analyzePdf(List<int> bytes) =>
+      invoke('pdf.analyze', {'bytes_hex': _hex(bytes)});
+
   /// 合并本地状态与远端变更。
   ///
   /// 返回 `{state, stats, conflictRate, effects}`：

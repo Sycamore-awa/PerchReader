@@ -115,6 +115,14 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             Ok(json!({ "fingerprint": fingerprint.to_hex() }))
         }
 
+        // ---- PDF（perch-pdf）----
+        "pdf.analyze" => {
+            let bytes = hex_to_bytes(required_str(&args, "bytes_hex")?)?;
+            let info = perch_pdf::analyze(&bytes)
+                .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
+            serde_json::to_value(&info).map_err(|error| FfiError::bad_args(error.to_string()))
+        }
+
         // ---- TXT（perch-txt）----
         "txt.analyze" => {
             let bytes = hex_to_bytes(required_str(&args, "bytes_hex")?)?;
@@ -613,6 +621,73 @@ mod tests {
         .to_string();
         let second = dispatch("sync.delta", &args);
         assert_eq!(second["changes"].as_array().unwrap().len(), 0);
+    }
+
+    // ---------- PDF 结构 ----------
+
+    /// 造一个 n 页的最小 PDF，用于端到端验证 pdf.analyze。
+    fn pdf_fixture(pages: usize) -> Vec<u8> {
+        use lopdf::{Dictionary, Document, Object, dictionary};
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let mut page_ids = Vec::new();
+        for _ in 0..pages {
+            let contents = document.add_object(lopdf::Stream::new(Dictionary::new(), Vec::new()));
+            let page = document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Contents" => contents,
+            });
+            page_ids.push(page);
+        }
+        let kids: Vec<Object> = page_ids.iter().map(|id| Object::Reference(*id)).collect();
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => i64::try_from(pages).unwrap(),
+            }),
+        );
+        let info_id = document.add_object(dictionary! {
+            "Title" => Object::string_literal("测试文档"),
+        });
+        document.trailer.set("Info", info_id);
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn pdf_analyze_reports_pages_and_title() {
+        let bytes = pdf_fixture(7);
+        let args = json!({ "bytes_hex": hex(&bytes) }).to_string();
+        let out = dispatch("pdf.analyze", &args);
+        assert_eq!(out["pageCount"], 7);
+        assert_eq!(out["title"], "测试文档");
+        assert_eq!(out["version"], "1.7");
+    }
+
+    #[test]
+    fn pdf_analyze_rejects_non_pdf() {
+        let args = json!({ "bytes_hex": hex(b"definitely not pdf") }).to_string();
+        let out = dispatch("pdf.analyze", &args);
+        assert_eq!(out["error"]["code"], "PDF_NOT_PDF");
+    }
+
+    #[test]
+    fn pdf_analyze_rejects_empty() {
+        let out = dispatch("pdf.analyze", r#"{"bytes_hex":""}"#);
+        assert_eq!(out["error"]["code"], "PDF_EMPTY");
     }
 
     #[test]
