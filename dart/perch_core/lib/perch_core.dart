@@ -170,6 +170,32 @@ class PerchCore {
     return (result['hits'] as List).cast<Map<String, dynamic>>();
   }
 
+  /// 合并本地状态与远端变更。
+  ///
+  /// 返回 `{state, stats, conflictRate, effects}`：
+  /// `state` 是合并后的寄存器快照（可直接落盘），`conflictRate` 是
+  /// 「被丢弃的字段级变更 / 总字段级变更」。
+  Map<String, dynamic> mergeSync({
+    required List<Map<String, dynamic>> local,
+    required List<Map<String, dynamic>> remote,
+  }) =>
+      invoke('sync.merge', {'local': local, 'remote': remote});
+
+  /// 增量同步：给定寄存器快照与游标，取一页变更。
+  ///
+  /// `since` 为空表示首次同步。返回 `{changes, nextCursor, hasMore}`，
+  /// 下次请求把 `nextCursor` 原样传回来即可。
+  Map<String, dynamic> deltaSync({
+    required List<Map<String, dynamic>> state,
+    String? since,
+    int? limit,
+  }) =>
+      invoke('sync.delta', {
+        'state': state,
+        if (since != null) 'since': since,
+        if (limit != null) 'limit': limit,
+      });
+
   static String _hex(List<int> bytes) {
     final buffer = StringBuffer();
     for (final byte in bytes) {

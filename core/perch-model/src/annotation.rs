@@ -17,7 +17,7 @@ use crate::timestamp::Timestamp;
 use crate::util::is_false;
 
 /// 标注唯一标识（UUID v4）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AnnotationId(Uuid);
 

@@ -66,6 +66,10 @@ impl FfiError {
         Self::new(error.code(), error.to_string())
     }
 
+    fn from_sync(error: &perch_sync::SyncError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+
     fn to_value(&self) -> Value {
         json!({ "error": { "code": self.code, "message": self.message } })
     }
@@ -209,10 +213,60 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             }
         }
 
+        // 一次往返完成双向同步的合并：本地状态 + 远端变更 → 新状态 + 冲突统计
+        "sync.merge" => {
+            let local = changes_arg(&args, "local")?;
+            let remote = changes_arg(&args, "remote")?;
+            let mut log = perch_sync::ChangeLog::from_changes(&local)
+                .map_err(|err| FfiError::from_sync(&err))?;
+            let report = log
+                .apply_all(&remote)
+                .map_err(|err| FfiError::from_sync(&err))?;
+            Ok(json!({
+                "state": log.to_changes(),
+                "stats": report.stats,
+                "conflictRate": report.conflict_rate(),
+                "effects": report.effects.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
+            }))
+        }
+
+        // 增量同步的服务端实现：给游标 + 页大小，返回一页变更
+        "sync.delta" => {
+            let state = changes_arg(&args, "state")?;
+            let log = perch_sync::ChangeLog::from_changes(&state)
+                .map_err(|err| FfiError::from_sync(&err))?;
+            let since = match args.get("since").and_then(Value::as_str) {
+                None => None,
+                Some(text) => Some(
+                    perch_sync::Hlc::parse(text)
+                        .ok_or_else(|| FfiError::new("SYNC_BAD_HLC", "since 的 HLC 格式非法"))?,
+                ),
+            };
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(perch_sync::DEFAULT_PAGE_LIMIT, |n| n as usize);
+            let page = log.changes_since(since.as_ref(), limit);
+            Ok(json!({
+                "changes": page.changes,
+                "nextCursor": page.next_cursor.map(|hlc| hlc.to_string()),
+                "hasMore": page.has_more,
+            }))
+        }
+
         other => Err(FfiError::new(
             "FFI_UNKNOWN_METHOD",
             format!("未知方法: {other}"),
         )),
+    }
+}
+
+/// 从入参里取一个变更数组（字段缺省视为空数组）。
+fn changes_arg(args: &Value, field: &str) -> Result<Vec<perch_sync::Change>, FfiError> {
+    match args.get(field) {
+        None => Ok(Vec::new()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| FfiError::bad_args(format!("{field}: {error}"))),
     }
 }
 
@@ -471,5 +525,100 @@ mod tests {
     #[test]
     fn null_pointer_free_is_safe() {
         unsafe { perch_string_free(std::ptr::null_mut()) };
+    }
+
+    // ---------- 同步（perch-sync 的传输层）----------
+
+    const BOOK: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// 一条进度变更的 JSON（`hlc` 是文本形式）。
+    fn progress_change(hlc: &str, progression: f64) -> Value {
+        json!({
+            "book": BOOK,
+            "hlc": hlc,
+            "op": "set",
+            "value": {
+                "kind": "progress",
+                "locator": { "href": "c1.xhtml", "locations": { "progression": progression } }
+            }
+        })
+    }
+
+    fn merge(local: Vec<Value>, remote: Vec<Value>) -> Value {
+        let args = json!({ "local": local, "remote": remote }).to_string();
+        dispatch("sync.merge", &args)
+    }
+
+    #[test]
+    fn sync_merge_initializes_from_empty() {
+        let out = merge(vec![], vec![progress_change("100-0-iphone", 0.5)]);
+        assert_eq!(out["state"].as_array().unwrap().len(), 1);
+        assert_eq!(out["effects"][0], "initialized");
+        assert_eq!(out["stats"]["initialized"], 1);
+        assert_eq!(out["conflictRate"], 0.0);
+    }
+
+    #[test]
+    fn sync_merge_ignores_older_remote() {
+        let out = merge(
+            vec![progress_change("200-0-iphone", 0.9)],
+            vec![progress_change("100-0-ipad", 0.1)],
+        );
+        assert_eq!(out["effects"][0], "staleIgnored");
+        assert_eq!(out["stats"]["staleIgnored"], 1);
+        // 状态里仍是本地那条
+        assert_eq!(out["state"][0]["hlc"], "200-0-iphone");
+    }
+
+    #[test]
+    fn sync_merge_is_idempotent() {
+        let change = progress_change("100-0-iphone", 0.5);
+        let once = merge(vec![], vec![change.clone()]);
+        let twice = merge(once["state"].as_array().unwrap().clone(), vec![change]);
+        assert_eq!(twice["effects"][0], "unchanged");
+        assert_eq!(twice["conflictRate"], 0.0);
+    }
+
+    #[test]
+    fn sync_merge_two_devices_converge() {
+        let phone = progress_change("100-0-iphone", 0.3);
+        let pad = progress_change("110-0-ipad", 0.7);
+        let a = merge(vec![phone.clone()], vec![pad.clone()]);
+        let b = merge(vec![pad], vec![phone]);
+        assert_eq!(a["state"], b["state"], "两端必须收敛到同一状态");
+    }
+
+    #[test]
+    fn sync_merge_rejects_mismatched_target() {
+        // 进度值却带了 annotation 字段 → 目标与值类型不匹配
+        let mut bad = progress_change("100-0-iphone", 0.5);
+        bad["annotation"] = json!("22222222-2222-4222-8222-222222222222");
+        let out = merge(vec![], vec![bad]);
+        assert_eq!(out["error"]["code"], "SYNC_TARGET_MISMATCH");
+    }
+
+    #[test]
+    fn sync_delta_walks_with_cursor() {
+        let args = json!({ "state": [progress_change("100-0-iphone", 0.3)] }).to_string();
+        let first = dispatch("sync.delta", &args);
+        assert_eq!(first["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(first["nextCursor"], "100-0-iphone");
+        assert_eq!(first["hasMore"], false);
+
+        // 用上一页的游标再问 → 没有增量
+        let args = json!({
+            "state": json!([progress_change("100-0-iphone", 0.3)]),
+            "since": "100-0-iphone",
+        })
+        .to_string();
+        let second = dispatch("sync.delta", &args);
+        assert_eq!(second["changes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sync_delta_rejects_bad_cursor() {
+        let args = json!({ "state": [], "since": "不是HLC" }).to_string();
+        let out = dispatch("sync.delta", &args);
+        assert_eq!(out["error"]["code"], "SYNC_BAD_HLC");
     }
 }

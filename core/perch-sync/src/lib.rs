@@ -30,10 +30,16 @@
 //! 并如实说明这一情形会破坏收敛——宁可在文档里讲清楚，也不要假装它不存在。
 
 pub mod hlc;
+pub mod wire;
 
 use perch_model::Locator;
 
 pub use hlc::Hlc;
+pub use wire::{
+    Change, ChangeKey, ChangeLog, ChangeOp, ChangePage, DEFAULT_PAGE_LIMIT, MergeReport,
+    PROTOCOL_VERSION, SyncError, SyncRequest, SyncResponse, WireValue, check_protocol,
+    validate_all,
+};
 
 /// 一次合并的效果。
 ///
@@ -54,8 +60,23 @@ pub enum MergeEffect {
     Unchanged,
 }
 
+impl MergeEffect {
+    /// 稳定的字符串表示（FFI / 日志 / 统计上报用）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Updated => "updated",
+            Self::StaleIgnored => "staleIgnored",
+            Self::ConflictResolved => "conflictResolved",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
 /// 合并统计（用于计算冲突率）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MergeStats {
     /// 首次采纳（本地为空）。
     pub initialized: u32,

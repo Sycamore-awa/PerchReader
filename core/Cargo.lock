@@ -289,6 +289,9 @@ name = "perch-sync"
 version = "0.1.0"
 dependencies = [
  "perch-model",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

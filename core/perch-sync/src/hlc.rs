@@ -143,6 +143,22 @@ impl fmt::Display for Hlc {
     }
 }
 
+// HLC 在线上用它的文本形式（`{wall_ms}-{counter}-{device}`）传输：
+// 与 `Display`/`parse` 完全一致，JSON 里可读、体积也小，
+// 不需要再维护第二套二进制布局。
+impl serde::Serialize for Hlc {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Hlc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| serde::de::Error::custom("非法的 HLC 文本"))
+    }
+}
+
 impl Ord for Hlc {
     fn cmp(&self, other: &Self) -> Ordering {
         self.wall_ms

@@ -11,6 +11,7 @@
 //
 // 任何一项不符预期就以非零码退出，可直接放进 CI。
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:perch_core/perch_core.dart';
@@ -165,6 +166,70 @@ void main(List<String> args) {
   check('HLC 物理时间', hlc['wall_ms'], 1760600000000);
   check('HLC 计数', hlc['counter'], 3);
   check('HLC 设备', hlc['device'], 'phoneA');
+
+  // ---- 9) 同步传输层：变更 / 增量游标 / 冲突率 ----
+  stdout.writeln('[9] 同步传输层');
+  const bookId = '11111111-1111-4111-8111-111111111111';
+  Map<String, dynamic> progressChange(String hlc, num progression) => {
+        'book': bookId,
+        'hlc': hlc,
+        'op': 'set',
+        'value': {
+          'kind': 'progress',
+          'locator': {
+            'href': 'c1.xhtml',
+            'locations': {'progression': progression},
+          },
+        },
+      };
+
+  // 空本地 + 一条远端 → 首次采纳
+  final merged = core.mergeSync(
+    local: <Map<String, dynamic>>[],
+    remote: [progressChange('100-0-phone', 0.5)],
+  );
+  check('合并后寄存器数', (merged['state'] as List).length, 1);
+  check('首次采纳的效果', (merged['effects'] as List).first, 'initialized');
+  check('无冲突时冲突率', merged['conflictRate'], 0.0);
+
+  // 两端各自先改，再互相交换 → 状态必须一致
+  final phoneSide = core.mergeSync(
+    local: [progressChange('100-0-phone', 0.3)],
+    remote: [progressChange('110-0-pad', 0.7)],
+  );
+  final padSide = core.mergeSync(
+    local: [progressChange('110-0-pad', 0.7)],
+    remote: [progressChange('100-0-phone', 0.3)],
+  );
+  checkTrue(
+    '两设备收敛到同一状态',
+    jsonEncode(phoneSide['state']) == jsonEncode(padSide['state']),
+    'phone=${phoneSide['state']} pad=${padSide['state']}',
+  );
+
+  // 同一 HLC、不同值 → 真正的冲突，应当被计入冲突率
+  final conflicted = core.mergeSync(
+    local: [progressChange('100-0-phone', 0.5)],
+    remote: [progressChange('100-0-phone', 0.9)],
+  );
+  check('冲突的效果', (conflicted['effects'] as List).first, 'conflictResolved');
+  checkTrue(
+    '冲突率被计入',
+    (conflicted['conflictRate'] as num) > 0,
+    'conflictRate=${conflicted['conflictRate']}',
+  );
+
+  // 增量游标：拿到一页后带游标再问，应当没有增量
+  final page1 = core.deltaSync(state: [progressChange('100-0-phone', 0.5)]);
+  check('增量条数', (page1['changes'] as List).length, 1);
+  check('游标', page1['nextCursor'], '100-0-phone');
+  check('是否还有下一页', page1['hasMore'], false);
+
+  final emptyDelta = core.deltaSync(
+    state: [progressChange('100-0-phone', 0.5)],
+    since: '100-0-phone',
+  );
+  check('游标之后无增量', (emptyDelta['changes'] as List).length, 0);
 
   // ---- 汇总 ----
   stdout.writeln('');
