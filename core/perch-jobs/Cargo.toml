@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 perch-model.workspace = true
 perch-epub.workspace = true
+perch-txt.workspace = true
 perch-index.workspace = true
 perch-pipeline.workspace = true
 serde.workspace = true
@@ -16,6 +17,10 @@ thiserror.workspace = true
 [dev-dependencies]
 # 仅测试用：在内存里造 EPUB 夹具
 zip.workspace = true
+# 仅测试用：造 GBK 等非 UTF-8 的 TXT 夹具
+encoding_rs.workspace = true
+# 仅测试用：验证 BookText / Refinement 的 JSON 契约
+serde_json.workspace = true
 
 [lints]
 workspace = true

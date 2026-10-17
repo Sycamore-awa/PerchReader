@@ -30,11 +30,13 @@
 //! 并如实说明这一情形会破坏收敛——宁可在文档里讲清楚，也不要假装它不存在。
 
 pub mod hlc;
+pub mod server;
 pub mod wire;
 
 use perch_model::Locator;
 
 pub use hlc::Hlc;
+pub use server::SyncServer;
 pub use wire::{
     Change, ChangeKey, ChangeLog, ChangeOp, ChangePage, DEFAULT_PAGE_LIMIT, MergeReport,
     PROTOCOL_VERSION, SyncError, SyncRequest, SyncResponse, WireValue, check_protocol,

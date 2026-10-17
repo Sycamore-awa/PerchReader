@@ -36,7 +36,7 @@
 use std::ffi::CString;
 
 use perch_import::Fingerprint;
-use perch_model::{Locator, ModelError};
+use perch_model::{Format, Locator, ModelError};
 use perch_pagecurl::{Corner, CurlInput, Rect, Vec2, curl};
 use serde_json::{Value, json};
 
@@ -189,8 +189,9 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
                 .get("max_chars")
                 .and_then(Value::as_u64)
                 .unwrap_or(perch_jobs::ExtractOptions::default().max_chars);
+            let format = format_arg(&args)?.unwrap_or_else(|| perch_jobs::sniff_format(&bytes));
             let refinement =
-                perch_jobs::refine_epub(&bytes, perch_jobs::ExtractOptions { max_chars })
+                perch_jobs::refine(&bytes, format, perch_jobs::ExtractOptions { max_chars })
                     .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
             serde_json::to_value(&refinement).map_err(|error| FfiError::bad_args(error.to_string()))
         }
@@ -202,8 +203,10 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
                 .get("chunk_chars")
                 .and_then(Value::as_u64)
                 .unwrap_or(perch_index::DEFAULT_CHUNK_CHARS);
-            let text = perch_jobs::extract_epub_text(&bytes, perch_jobs::ExtractOptions::default())
-                .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
+            let format = format_arg(&args)?.unwrap_or_else(|| perch_jobs::sniff_format(&bytes));
+            let text =
+                perch_jobs::extract_text(&bytes, format, perch_jobs::ExtractOptions::default())
+                    .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
             let index = perch_jobs::index_book(&text, chunk_chars);
             let stats = index.stats();
             let char_count = text.char_count();
@@ -406,6 +409,22 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             "FFI_UNKNOWN_METHOD",
             format!("未知方法: {other}"),
         )),
+    }
+}
+
+/// 解析可选的 `format` 参数（`"epub"` / `"pdf"` / `"txt"`）。
+///
+/// 不给时返回 `None`，由调用方按内容嗅探 —— 但上层知道扩展名时**应当显式传**：
+/// 嗅探会把一个损坏的 EPUB 当成 TXT 收下，静默产出一本乱码书。
+fn format_arg(args: &Value) -> Result<Option<Format>, FfiError> {
+    let Some(text) = args.get("format").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    match text {
+        "epub" => Ok(Some(Format::Epub)),
+        "pdf" => Ok(Some(Format::Pdf)),
+        "txt" => Ok(Some(Format::Txt)),
+        other => Err(FfiError::bad_args(format!("未知格式: {other}"))),
     }
 }
 
@@ -847,10 +866,42 @@ mod tests {
     }
 
     #[test]
-    fn jobs_refine_rejects_non_epub() {
-        let args = json!({ "bytes_hex": hex(b"not a zip at all") }).to_string();
+    fn jobs_refine_honours_explicit_format() {
+        // 显式声明是 epub，内容却是随便的字节 → 必须报 EPUB 解析失败，
+        // 绝不能悄悄当成纯文本收下。
+        let args = json!({
+            "bytes_hex": hex(b"not a zip at all"),
+            "format": "epub",
+        })
+        .to_string();
         let out = dispatch("jobs.refine", &args);
         assert_eq!(out["error"]["code"], "JOBS_EPUB");
+    }
+
+    #[test]
+    fn jobs_refine_auto_detects_txt() {
+        // 不给 format 时按内容嗅探：非 ZIP/PDF 一律当纯文本
+        let args = json!({ "bytes_hex": hex("普通的中文文本".as_bytes()) }).to_string();
+        let out = dispatch("jobs.refine", &args);
+        assert!(out["error"].is_null(), "应当成功: {out}");
+        assert!(out["title"].is_null(), "TXT 没有内嵌标题");
+        assert!(out["charCount"].as_u64().unwrap() > 0);
+        assert!(out["encoding"].is_string(), "TXT 应当带编码探测结果");
+    }
+
+    #[test]
+    fn jobs_refine_rejects_unknown_format() {
+        let args = json!({ "bytes_hex": "00", "format": "mobi" }).to_string();
+        let out = dispatch("jobs.refine", &args);
+        assert_eq!(out["error"]["code"], "FFI_BAD_ARGS");
+    }
+
+    #[test]
+    fn jobs_refine_rejects_pdf() {
+        // PDF 只做结构解析，不进阶段②③
+        let args = json!({ "bytes_hex": hex(b"%PDF-1.7"), "format": "pdf" }).to_string();
+        let out = dispatch("jobs.refine", &args);
+        assert_eq!(out["error"]["code"], "JOBS_UNSUPPORTED_FORMAT");
     }
 
     // ---------- 句柄表：打开 / 搜索 / 关闭 ----------

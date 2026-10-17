@@ -249,7 +249,7 @@ void main(List<String> args) {
 
   // 非 PDF 必须明确拒绝，而不是当成空文档
   try {
-    core.analyzePdf('not a pdf'.codeUnits);
+    core.analyzePdf(utf8.encode('not a pdf'));
     checkTrue('非 PDF 应当报错', false, '没有抛异常');
   } on PerchCoreException catch (error) {
     check('非 PDF 的错误码', error.code, 'PDF_NOT_PDF');
@@ -258,10 +258,10 @@ void main(List<String> args) {
   // ---- 11) 阶段②精修（按错误路径验证边界；成功路径由 Rust FFI 测试覆盖）----
   stdout.writeln('[11] 阶段②精修');
   try {
-    core.refineEpub('这不是 epub'.codeUnits);
+    core.refineBook(utf8.encode('这不是 epub'), format: 'epub');
     checkTrue('非 EPUB 应当报错', false, '没有抛异常');
   } on PerchCoreException catch (error) {
-    check('非 EPUB 的错误码', error.code, 'JOBS_EPUB');
+    check('显式声明 epub 但内容不是 → 解析失败', error.code, 'JOBS_EPUB');
   }
 
   // ---- 12) 句柄表：打开一本书 → 搜索 → 关闭 ----
@@ -293,6 +293,41 @@ void main(List<String> args) {
   } on PerchCoreException catch (error) {
     check('关闭后的错误码', error.code, 'BOOK_BAD_HANDLE');
   }
+
+  // ---- 13) TXT 全链路：精修 → 打开 → 搜索 → 关闭 ----
+  stdout.writeln('[13] TXT 全链路');
+  final txtBytes = utf8.encode('第一章\r\n\r\n\r\n苹果和香蕉都很好吃');
+
+  final txtRefined = core.refineBook(txtBytes, format: 'txt');
+  checkTrue(
+    'TXT 精修给出了编码探测结果',
+    txtRefined['encoding'] is String,
+    'encoding=${txtRefined['encoding']}',
+  );
+  checkTrue(
+    'TXT 字数大于 0',
+    (txtRefined['charCount'] as num) > 0,
+    'charCount=${txtRefined['charCount']}',
+  );
+  checkTrue('TXT 没有内嵌标题', txtRefined['title'] == null, 'title=${txtRefined['title']}');
+
+  final txtOpened = core.openBook(txtBytes, format: 'txt');
+  final txtHandle = txtOpened['handle'] as int;
+  final txtFound = core.searchBook(handle: txtHandle, query: '苹果');
+  final txtHits = txtFound['hits'] as List;
+  check('TXT 搜索命中数', txtHits.length, 1);
+  final txtLocator = (txtHits.first as Map)['locator'] as Map;
+  check('TXT Locator 格式', (txtLocator['perch'] as Map)['format'], 'txt');
+  checkTrue(
+    'TXT Locator 带字符偏移（跨端最稳的锚点）',
+    (txtLocator['perch'] as Map)['txtOffset'] is int,
+    'perch=${txtLocator['perch']}',
+  );
+  core.closeBook(txtHandle);
+
+  // 不给 format 时按内容嗅探，也应当认出这是纯文本
+  final sniffed = core.refineBook(utf8.encode('纯文本'));
+  checkTrue('嗅探认出了纯文本', (sniffed['charCount'] as num) > 0, 'out=$sniffed');
 
   // ---- 汇总 ----
   stdout.writeln('');

@@ -488,11 +488,14 @@ dependencies = [
 name = "perch-jobs"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "perch-epub",
  "perch-index",
  "perch-model",
  "perch-pipeline",
+ "perch-txt",
  "serde",
+ "serde_json",
  "thiserror",
  "zip",
 ]

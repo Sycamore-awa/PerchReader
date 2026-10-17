@@ -1,5 +1,5 @@
 //! 把调度器（[`perch_pipeline::Scheduler`]）和执行者（本 crate 的
-//! [`refine_epub`] / [`extract_epub_text`] / [`index_book`]）接起来的**驱动循环**。
+//! [`refine`] / [`extract_text`] / [`index_book`]）接起来的**驱动循环**。
 //!
 //! # 为什么这段逻辑必须在 Rust 里
 //!
@@ -23,12 +23,10 @@
 //! 崩溃发生在两者之间时，重启后看到的是"上一步已完成"，会重做当前步——
 //! ②和③都是幂等的，重做安全。
 
-use perch_model::{BookId, ImportState};
+use perch_model::{BookId, Format, ImportState};
 use perch_pipeline::{Gate, Policy, Priority, Scheduler, Stage};
 
-use crate::{
-    BookText, ExtractOptions, JobsError, Refinement, extract_epub_text, index_book, refine_epub,
-};
+use crate::{BookText, ExtractOptions, JobsError, Refinement, extract_text, index_book, refine};
 
 /// 平台侧需要提供的存储能力。
 ///
@@ -37,6 +35,13 @@ use crate::{
 pub trait BookStore {
     /// 读出这本书的原始字节（平台从沙盒读）。
     fn read_bytes(&mut self, book: BookId) -> Result<Vec<u8>, String>;
+
+    /// 这本书的格式。
+    ///
+    /// **必须由调用方给出，不要靠嗅探**：一个损坏的 `.epub` 若被嗅探成
+    /// 纯文本，会被"成功"登记成一本乱码书——静默产出一个坏结果，
+    /// 比明确报错糟糕得多。导入阶段从扩展名已经知道格式，直接给出来即可。
+    fn format(&mut self, book: BookId) -> Result<Format, String>;
 
     /// 更新导入状态。
     fn set_state(&mut self, book: BookId, state: ImportState) -> Result<(), String>;
@@ -201,7 +206,11 @@ impl<S: BookStore> Pipeline<S> {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(book, Stage::Refine, error, now_ms),
         };
-        let refinement = match refine_epub(&bytes, self.options) {
+        let format = match self.store.format(book) {
+            Ok(format) => format,
+            Err(error) => return self.fail(book, Stage::Refine, error, now_ms),
+        };
+        let refinement = match refine(&bytes, format, self.options) {
             Ok(refinement) => refinement,
             Err(error) => return self.fail(book, Stage::Refine, describe(&error), now_ms),
         };
@@ -225,7 +234,11 @@ impl<S: BookStore> Pipeline<S> {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(book, Stage::Index, error, now_ms),
         };
-        let text = match extract_epub_text(&bytes, self.options) {
+        let format = match self.store.format(book) {
+            Ok(format) => format,
+            Err(error) => return self.fail(book, Stage::Index, error, now_ms),
+        };
+        let text = match extract_text(&bytes, format, self.options) {
             Ok(text) => text,
             Err(error) => return self.fail(book, Stage::Index, describe(&error), now_ms),
         };
@@ -289,6 +302,7 @@ mod tests {
 
     use super::*;
     use crate::tests::build_epub;
+    use perch_model::Format;
     use std::collections::HashMap;
 
     /// 内存存储：记录所有调用，便于断言"先落库再进下一步"。
@@ -300,6 +314,7 @@ mod tests {
         indexes: Vec<(usize, usize)>,
         fail_read: bool,
         fail_save_refinement: bool,
+        formats: HashMap<BookId, Format>,
     }
 
     impl BookStore for FakeStore {
@@ -311,6 +326,11 @@ mod tests {
                 .get(&book)
                 .cloned()
                 .ok_or_else(|| "文件不存在".to_owned())
+        }
+
+        fn format(&mut self, book: BookId) -> Result<Format, String> {
+            // 默认 EPUB；测试可以按书覆盖
+            Ok(self.formats.get(&book).copied().unwrap_or(Format::Epub))
         }
 
         fn set_state(&mut self, book: BookId, state: ImportState) -> Result<(), String> {
@@ -549,5 +569,52 @@ mod tests {
         pipeline.cancel(book);
         assert!(pipeline.is_idle());
         assert_eq!(pipeline.step(0, Gate::foreground()), StepOutcome::Idle);
+    }
+    #[test]
+    fn txt_book_runs_through_both_stages() {
+        let book = BookId::new();
+        let mut store = FakeStore::default();
+        store
+            .files
+            .insert(book, "第一章\r\n\r\n\r\n中文纯文本内容".as_bytes().to_vec());
+        store.formats.insert(book, Format::Txt);
+        let mut pipeline = pipeline_with(store);
+        pipeline.enqueue(book, ImportState::Registered, Priority::Normal);
+
+        let summary = pipeline.run_until_idle(0, Gate::foreground(), 20);
+        assert_eq!(summary.refined, 1);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(
+            pipeline.store().states,
+            vec![
+                (book, ImportState::Refining),
+                (book, ImportState::Indexing),
+                (book, ImportState::Ready),
+            ]
+        );
+        // 编码探测结果应当被落库（TXT 特有）
+        let encoding = pipeline.store().refinements[0].encoding.clone();
+        assert!(encoding.is_some(), "TXT 精修应带上探测到的编码");
+    }
+
+    #[test]
+    fn pdf_book_fails_with_unsupported_format() {
+        let book = BookId::new();
+        let mut store = FakeStore::default();
+        store.files.insert(book, b"%PDF-1.7".to_vec());
+        store.formats.insert(book, Format::Pdf);
+        let mut pipeline = pipeline_with(store);
+        pipeline.enqueue(book, ImportState::Registered, Priority::Normal);
+
+        match pipeline.step(0, Gate::foreground()) {
+            StepOutcome::Failed { stage, error, .. } => {
+                assert_eq!(stage, Stage::Refine);
+                assert!(
+                    error.contains("JOBS_UNSUPPORTED_FORMAT"),
+                    "应当报不支持的格式，实际 {error}"
+                );
+            }
+            other => panic!("PDF 应当失败，实际 {other:?}"),
+        }
     }
 }

@@ -24,6 +24,18 @@ pub struct Metadata {
     pub publisher: Option<String>,
     /// 简介。
     pub description: Option<String>,
+    /// EPUB2 的封面声明：`<meta name="cover" content="..."/>` 里的 `content`，
+    /// 是清单项的 **id**（不是路径）。要拿到封面路径需再用
+    /// [`Package::item_by_id`] 换成 [`ManifestItem::href`]，
+    /// 或直接用 [`Package::cover_image`]。
+    ///
+    /// 这是 **EPUB2** 的写法。EPUB3 把封面写成清单项上的
+    /// `properties="cover-image"`，不在元数据里——两者都由
+    /// [`Package::cover_image`] 统一处理。
+    ///
+    /// 本结构体不派生 serde（`perch-epub` 不依赖 serde），
+    /// 对外序列化时由调用方决定字段名。
+    pub cover_id: Option<String>,
 }
 
 impl Metadata {
@@ -194,6 +206,44 @@ impl Package {
             .iter()
             .find(|item| item.media_type.as_deref() == Some("application/x-dtbncx+xml"))
     }
+
+    /// 封面在容器内的绝对路径：优先 EPUB3 的 `properties="cover-image"`，
+    /// 其次 EPUB2 的 `<meta name="cover">` 指向的 manifest id。
+    /// 两者都没有时返回 `None` —— 不猜。
+    ///
+    /// 返回值是清单项的 [`href`](ManifestItem::href)，即**容器绝对路径**
+    /// （带前导 `/`），可直接交给 [`crate::EpubArchive::read`]。
+    ///
+    /// 两条路径都不做"启发式"：不把清单里的第一张图片当封面（那多半是
+    /// 出版社 logo 或装饰图），也不按 id 名字猜（`cover` / `cover-image` 之类）。
+    ///
+    /// EPUB2 分支会检查 `media-type`：`<meta name="cover">` 有少数情况下指向
+    /// 一个 **XHTML 封面页**而非图片，那种 href 不能当缩略图用，此时返回 `None`。
+    #[must_use]
+    pub fn cover_image(&self) -> Option<&str> {
+        // EPUB3：封面是清单项上的属性，规范写法定死了，最可靠，优先采用。
+        if let Some(item) = self
+            .manifest
+            .iter()
+            .find(|item| item.has_property("cover-image"))
+        {
+            return Some(item.href.as_str());
+        }
+
+        // EPUB2：`<meta name="cover" content="清单 id"/>` 只给了 id，需要回到清单里找。
+        // id 悬空（指向不存在的清单项）时返回 None，而不是退而求其次挑一个别的项。
+        let id = self.metadata.cover_id.as_deref()?;
+        let item = self.item_by_id(id)?;
+        // 少数 EPUB2 把 `name="cover"` 指向一个 **XHTML 封面页**而不是图片。
+        // 把那个 href 当缩略图会渲染成文字/坏图，所以只在**能确定不是图片**时拒绝；
+        // media-type 缺失（None）无从判断，放行。
+        if let Some(media_type) = item.media_type.as_deref()
+            && !media_type.starts_with("image/")
+        {
+            return None;
+        }
+        Some(item.href.as_str())
+    }
 }
 
 /// 把相对 `href` 解析为**容器绝对路径**（带前导 `/`）。
@@ -314,6 +364,17 @@ impl ParseState {
                 }
             }
 
+            // EPUB2 的封面声明：`<meta name="cover" content="清单 id"/>`。
+            // 必须排在下面"元数据文本字段"的通配分支之前——`meta` 不是文本字段，
+            // 走通配分支只会白跑一趟 `metadata_field`；同时这里不区分自闭合与否，
+            // `<meta .../>` 与 `<meta ...></meta>` 两种写法都能接住。
+            "meta" if self.section == Section::Metadata => {
+                if let Some(id) = cover_meta_id(element) {
+                    // 与其它单值元数据字段一致：多份声明时第一份生效
+                    set_if_none(&mut self.metadata.cover_id, id);
+                }
+            }
+
             // 元数据字段：开始收集文本
             name if is_start && self.section == Section::Metadata => {
                 if let Some(field) = metadata_field(name) {
@@ -383,6 +444,36 @@ fn metadata_field(name: &str) -> Option<Field> {
         "description" => Some(Field::Description),
         _ => None,
     }
+}
+
+/// 从 `<meta>` 元素里取 **EPUB2** 封面声明指向的清单 id。
+///
+/// 只认 `<meta name="cover" content="..."/>` 这一种写法，其余 `<meta>` 一律返回
+/// `None`。两种 `meta` 的区分方式：
+///
+/// - **EPUB2** 用 `name` + `content`：`name` 是被声明的元数据名，`content` 是值；
+///   `content` 在这里是 manifest item 的 **id**。
+/// - **EPUB3** 用 `property` + 元素文本：`<meta property="dcterms:modified">...</meta>`，
+///   根本没有 `name` 属性。因此**只读 `name`、从不读 `property`**，
+///   `<meta property="cover">` 不会、也不能被当成 EPUB2 的封面声明。
+///
+/// 为了多一层保险：元素上只要出现 `property` 属性就按 EPUB3 处理、直接跳过，
+/// 即使它同时带着 `name="cover"` 也不认（真实书里没有这种混写）。
+///
+/// 大小写：**属性名**严格按 XML 规则大小写敏感（`NAME="cover"` 不认）；但 `cover`
+/// 这个**值**放宽为 ASCII 大小写不敏感——实践中确有生成器写成 `name="Cover"`，
+/// 而 `cover` 不是专有名词，这个宽容不会和别的东西撞车。
+fn cover_meta_id(element: &BytesStart<'_>) -> Option<String> {
+    if xml::attr(element, "property").is_some() {
+        return None;
+    }
+    let name = xml::attr(element, "name")?;
+    if !name.trim().eq_ignore_ascii_case("cover") {
+        return None;
+    }
+    let content = xml::attr(element, "content")?;
+    let content = content.trim();
+    (!content.is_empty()).then(|| content.to_owned())
 }
 
 /// 解析一个清单项；缺 `id` 或 `href` 时视为无效并跳过。
@@ -577,5 +668,132 @@ mod tests {
             ..Metadata::default()
         };
         assert_eq!(metadata.display_title(), "未命名");
+    }
+
+    /// 拼一个只关心封面所需的 OPF：`metadata` 与 `manifest` 由调用方给片段。
+    fn cover_package(metadata: &str, manifest: &str) -> Package {
+        let xml = format!(
+            r#"<package version="2.0"><metadata>{metadata}</metadata><manifest>{manifest}</manifest></package>"#
+        );
+        Package::parse("OEBPS/content.opf", &xml).unwrap()
+    }
+
+    #[test]
+    fn epub3_cover_image_property_is_returned() {
+        let package = cover_package(
+            "",
+            r#"<item id="chap" href="text/chap1.xhtml" media-type="application/xhtml+xml"/>
+               <item id="cov" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>"#,
+        );
+        assert_eq!(package.cover_image(), Some("/OEBPS/images/cover.jpg"));
+    }
+
+    #[test]
+    fn epub2_meta_cover_resolves_manifest_id_to_href() {
+        let package = cover_package(
+            r#"<meta name="cover" content="cov"/>"#,
+            r#"<item id="chap" href="text/chap1.xhtml" media-type="application/xhtml+xml"/>
+               <item id="cov" href="images/cover.jpg" media-type="image/jpeg"/>"#,
+        );
+        // meta 里存的是 id，不是路径
+        assert_eq!(package.metadata.cover_id.as_deref(), Some("cov"));
+        // 对外给的是容器绝对路径
+        assert_eq!(package.cover_image(), Some("/OEBPS/images/cover.jpg"));
+    }
+
+    #[test]
+    fn epub3_cover_wins_over_epub2_meta() {
+        let package = cover_package(
+            r#"<meta name="cover" content="old-cover"/>"#,
+            r#"<item id="old-cover" href="images/old.jpg" media-type="image/jpeg"/>
+               <item id="new-cover" href="images/new.jpg" media-type="image/jpeg" properties="cover-image"/>"#,
+        );
+        assert_eq!(package.metadata.cover_id.as_deref(), Some("old-cover"));
+        assert_eq!(
+            package.cover_image(),
+            Some("/OEBPS/images/new.jpg"),
+            "properties=\"cover-image\" 优先于 EPUB2 的 meta"
+        );
+    }
+
+    #[test]
+    fn cover_is_none_when_nothing_declares_it() {
+        // 清单里明明有图片、id 甚至就叫 `cover`，但没有声明就不能猜
+        let package = cover_package(
+            "",
+            r#"<item id="cover" href="images/cover.jpg" media-type="image/jpeg"/>
+               <item id="chap" href="text/chap1.xhtml" media-type="application/xhtml+xml"/>"#,
+        );
+        assert!(package.metadata.cover_id.is_none());
+        assert_eq!(
+            package.cover_image(),
+            None,
+            "不能把第一张图片 / 名字像封面的项当封面"
+        );
+    }
+
+    #[test]
+    fn dangling_cover_id_returns_none() {
+        let package = cover_package(
+            r#"<meta name="cover" content="ghost"/>"#,
+            r#"<item id="cover" href="images/cover.jpg" media-type="image/jpeg"/>"#,
+        );
+        assert_eq!(package.metadata.cover_id.as_deref(), Some("ghost"));
+        assert_eq!(
+            package.cover_image(),
+            None,
+            "id 悬空时返回 None，不能退回去挑一个相近的项"
+        );
+    }
+
+    #[test]
+    fn epub3_property_meta_is_not_an_epub2_cover_declaration() {
+        // EPUB3 的 `<meta property="...">` 与 EPUB2 的 `<meta name="...">` 是两种写法
+        let package = cover_package(
+            r#"<meta property="cover">cov</meta>
+               <meta property="dcterms:modified">2024-01-01T00:00:00Z</meta>"#,
+            r#"<item id="cov" href="images/cover.jpg" media-type="image/jpeg"/>"#,
+        );
+        assert!(
+            package.metadata.cover_id.is_none(),
+            "property 不能被当成 name"
+        );
+        assert_eq!(package.cover_image(), None);
+    }
+
+    #[test]
+    fn epub2_cover_pointing_at_a_cover_page_is_rejected() {
+        // 少数 EPUB2 把 name="cover" 指向 XHTML 封面**页**而不是图片。
+        // 那个 href 不能当缩略图用（会渲染成文字/坏图），必须拒绝。
+        let package = cover_package(
+            r#"<meta name="cover" content="coverpage"/>"#,
+            r#"<item id="coverpage" href="cover.xhtml" media-type="application/xhtml+xml"/>"#,
+        );
+        assert_eq!(package.metadata.cover_id.as_deref(), Some("coverpage"));
+        assert_eq!(package.cover_image(), None, "指向封面页时不能当图片返回");
+    }
+
+    #[test]
+    fn epub2_cover_without_media_type_is_accepted() {
+        // media-type 缺失时无从判断，放行而不是一律拒绝
+        let package = cover_package(
+            r#"<meta name="cover" content="cov"/>"#,
+            r#"<item id="cov" href="images/cover.jpg"/>"#,
+        );
+        assert_eq!(package.cover_image(), Some("/OEBPS/images/cover.jpg"));
+    }
+
+    #[test]
+    fn epub2_cover_meta_value_is_case_tolerant_and_first_wins() {
+        // 属性值放宽为 ASCII 大小写不敏感（实践中见过 name="Cover"）；
+        // 多份声明与其它单值元数据字段一致：第一份生效。
+        let package = cover_package(
+            r#"<meta name="Cover" content="cov"/>
+               <meta name="cover" content="other"/>"#,
+            r#"<item id="cov" href="images/cover.jpg" media-type="image/jpeg"/>
+               <item id="other" href="images/other.jpg" media-type="image/jpeg"/>"#,
+        );
+        assert_eq!(package.metadata.cover_id.as_deref(), Some("cov"));
+        assert_eq!(package.cover_image(), Some("/OEBPS/images/cover.jpg"));
     }
 }

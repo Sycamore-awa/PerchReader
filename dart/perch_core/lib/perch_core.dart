@@ -174,10 +174,17 @@ class PerchCore {
   ///
   /// 索引是有状态的重对象，句柄由本包托管：**用完必须 [closeBook]**。
   /// 同时最多打开 8 本，超出会报 `BOOK_TOO_MANY_OPEN`。
-  Map<String, dynamic> openBook(List<int> bytes, {int? chunkChars}) =>
+  /// `format` 同 [refineBook]：知道扩展名时请显式传。
+  /// `bytes` 同理必须是文件原始字节（见 [refineBook] 的 ⚠️）。
+  Map<String, dynamic> openBook(
+    List<int> bytes, {
+    int? chunkChars,
+    String? format,
+  }) =>
       invoke('book.open', {
         'bytes_hex': _hex(bytes),
         if (chunkChars != null) 'chunk_chars': chunkChars,
+        if (format != null) 'format': format,
       });
 
   /// 在已打开的索引里检索。
@@ -199,14 +206,28 @@ class PerchCore {
   Map<String, dynamic> closeBook(int handle) =>
       invoke('book.close', {'handle': handle});
 
-  /// 阶段②精修：解析 EPUB 的元数据 / 封面 / 目录 / 字数。
+  /// 阶段②精修：解析元数据 / 封面 / 目录 / 字数（EPUB 与 TXT，PDF 不支持）。
   ///
-  /// 返回 `{title?, author?, language?, coverHref?, toc, spineCount, charCount}`。
-  /// `maxChars` 限制抽取正文的字符数（超限会被截断，不会 OOM）。
-  Map<String, dynamic> refineEpub(List<int> bytes, {int? maxChars}) =>
+  /// ⚠️ `bytes` 必须是**文件原始字节**（UTF-8 编码的文本文件就是 UTF-8 字节）。
+  /// 不要传 `String.codeUnits` —— 那是 UTF-16 码元，纯 ASCII 时碰巧一样，
+  /// 一遇中文 Rust 侧收到的就是乱码，而且**不会报错**，只会安静地建出错误的索引。
+  /// 文本请用 `utf8.encode(text)`。
+  ///
+  /// 返回 `{title?, author?, language?, coverHref?, toc, spineCount, charCount,
+  /// encoding?}`。
+  ///
+  /// - `maxChars` 限制抽取正文的字符数（超限会被截断并置 `truncated`，不会 OOM）
+  /// - `format` 取 `'epub'` / `'txt'` / `'pdf'`。**上层知道扩展名时应当传**：
+  ///   不传就按内容嗅探，而嗅探会把一个损坏的 EPUB 当成纯文本收下。
+  Map<String, dynamic> refineBook(
+    List<int> bytes, {
+    int? maxChars,
+    String? format,
+  }) =>
       invoke('jobs.refine', {
         'bytes_hex': _hex(bytes),
         if (maxChars != null) 'max_chars': maxChars,
+        if (format != null) 'format': format,
       });
 
   /// 解析 PDF 结构（页数 / 大纲 / 元数据）。
