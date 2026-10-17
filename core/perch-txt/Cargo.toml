@@ -1,0 +1,14 @@
+[package]
+name = "perch-txt"
+description = "纯文本（TXT）处理：编码探测、解码、行列索引、字符/字节偏移换算"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+chardetng.workspace = true
+encoding_rs.workspace = true
+
+[lints]
+workspace = true
