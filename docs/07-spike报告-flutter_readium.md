@@ -106,7 +106,8 @@ class Locator extends AdditionalProperties implements JSONable {
    - 选项 A：`waydroid init` 下载 Android 镜像（1~2 GB，本机 Waydroid 1.6.3 已装、容器服务已 active，且 `/dev/kvm` 可用）
    - 选项 B：`sdkmanager --install "emulator" "system-images;android-36;google_apis;x86_64"`（约 2 GB，`dl.google.com` 已实测可达）
    - 这一步能回答真正的问题：Android 上（Readium Kotlin）能否渲染中文、拿到 Locator、做高亮
-2. **同时**把 iOS 侧接到云端 macOS CI（`macos-26-arm64` + Xcode 26.6），先只做"能编译 + 能跑模拟器测试"
+2. **同时**把 iOS 侧接到云端 macOS CI（**`macos-26`** + Xcode 26.6），先只做"能编译 + 能跑模拟器测试"
+   —— ✅ **已完成**（原文写 `macos-26-arm64`，那个标签不存在；实际 CI 三个 job 全绿，见 `docs/05` §九）
 3. web 的 `manifest.json` 问题可以**暂时不管**（我们不发布 web），但如果要向上游报 issue，本次的最小复现已经很清楚
 
 ## 六、附：本次产出的可复用资产
