@@ -1,0 +1,11 @@
+[package]
+name = "perch-pagecurl"
+description = "仿真翻页（卷页）的纯几何计算：折线、卷角、投影带、正面可见多边形与阴影参数"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
