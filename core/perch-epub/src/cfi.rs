@@ -24,12 +24,17 @@
 //! - `:n` 是末尾字符节点内的字符偏移；
 //! - `,` 分隔范围定位的各段。
 //!
-//! # 范围定位的语义（重要，尚未完全实现）
+//! # 范围定位的语义
 //!
-//! 规范里范围形如 `epubcfi(父路径, 起点, 终点)`，后两段是**相对父路径**的；
-//! 也常见两段式的简化写法。本模块**只做词法解析**，把各段原样保留在 [`Cfi::parts`] 里，
-//! **尚未实现"相对路径 → 绝对路径"的展开**。因此范围定位目前可用于透传与展示，
-//! 还不能用来做区间比较。这一点是有意为之：先把点定位做扎实。
+//! 规范里范围形如 `epubcfi(父路径, 起点, 终点)`，后两段是**相对父路径**的。
+//! [`Cfi::expand_range`] 按规范把端点**字符串拼接**到父路径上，得到两个点定位。
+//! 规范**没有两段式**：`epubcfi(a,b)` 不是合法 range，展开时会报
+//! [`CfiError::RangeArity`]。
+//!
+//! 跨内容文档的范围要靠"端点自带 `!`"表达，例如
+//! `epubcfi(/6,/4!/4/2,/6!/4/2)`：父路径只到 spine，两个端点各自跳到不同的
+//! 内容文档。父路径已经带 `!` 时端点不能再带（拼接后会出现两个间接引用，
+//! [`CfiError::NestedRangeIndirection`]）。
 //!
 //! # 设计取向
 //!
@@ -96,8 +101,9 @@ pub enum CfiError {
     #[error("范围 CFI 必须是 3 段（父, 起, 止），实际 {0} 段")]
     RangeArity(usize),
 
-    /// 范围 CFI 的 start/end 自带 `!` 间接引用。规范允许，但本项目暂不处理。
-    #[error("范围 CFI 的 start/end 自带 ! 间接引用，暂不支持")]
+    /// 范围 CFI 的父路径与端点**同时**自带 `!`：字符串拼接后会出现两个间接引用，
+    /// 无法确定唯一的跳转目标。
+    #[error("范围 CFI 的父路径与端点同时自带 ! 间接引用，无法拼接")]
     NestedRangeIndirection,
 }
 
@@ -379,6 +385,15 @@ impl Cfi {
     ///
     /// **不要**自己去想"共同祖先可以省略"之类的优化——规范没有这种说法。
     ///
+    /// 跨内容文档的范围用"端点自带 `!`"表达（父路径此时只到 spine）：
+    ///
+    /// ```text
+    /// epubcfi( /6 , /4!/4/2 , /6!/4/2 )
+    ///          │    └start┘  └ end┘
+    /// start = /6/4!/4/2
+    /// end   = /6/6!/4/2
+    /// ```
+    ///
     /// # 返回
     ///
     /// - `Ok(None)`：这是点定位（单段），没有范围可展开
@@ -388,7 +403,8 @@ impl Cfi {
     ///
     /// - [`CfiError::RangeArity`]：段数不是 1 或 3。
     ///   **规范没有两段式**，`epubcfi(a,b)` 不是合法 range。
-    /// - [`CfiError::NestedRangeIndirection`]：start/end 自带 `!`（规范允许，本项目暂不支持）
+    /// - [`CfiError::NestedRangeIndirection`]：父路径与端点同时自带 `!`，
+    ///   拼接后会出现两个间接引用。
     pub fn expand_range(&self) -> Result<Option<(Self, Self)>, CfiError> {
         match self.parts.len() {
             1 => Ok(None),
@@ -642,19 +658,38 @@ fn unescape_assertion(raw: &str) -> Result<String, CfiError> {
 
 /// 把范围 CFI 的一个端点局部路径**拼接**到父路径上（规范要求的"字符串拼接"语义）。
 ///
-/// - 间接引用（`!` 之前）沿用父路径的
-/// - 局部路径段 = 父的局部段 ++ 端点自己的局部段
-/// - 字符偏移优先取端点自己的
+/// 拼接规则按 `!` 的位置分三种情况：
+///
+/// - 父路径与端点都没有 `!`：局部路径段直接相接；
+/// - 父路径有 `!`、端点没有：沿用父路径的间接引用，局部路径段相接；
+/// - 父路径没有 `!`、端点有：端点的 `!` 就是唯一的间接引用，
+///   父路径的局部段（包内路径，如 `/6`）接到端点的间接段前面；
+/// - 两边都有 `!`：字符串拼接会出现两个 `!`，无法确定语义，报
+///   [`CfiError::NestedRangeIndirection`]。
+///
+/// 字符偏移优先取端点自己的。
 fn concat_path(parent: &CfiPath, endpoint: &CfiPath) -> Result<CfiPath, CfiError> {
-    if !endpoint.indirection.is_empty() {
-        // 规范允许端点自带 `!`，但那会引入二次跳转，本项目暂不处理。
+    if !parent.indirection.is_empty() && !endpoint.indirection.is_empty() {
+        // 拼接后会得到 `a!/b!/c` 这种双重间接引用，规范语法不允许。
         // 与其悄悄算错，不如明确报错。
         return Err(CfiError::NestedRangeIndirection);
     }
-    let mut local = parent.local.clone();
-    local.extend(endpoint.local.iter().cloned());
+
+    let (indirection, local) = if parent.indirection.is_empty() && !endpoint.indirection.is_empty()
+    {
+        // 父路径是包内路径（如范围 CFI 的父路径 `/6`），端点的 `!` 才是间接引用。
+        // 例：`/6` + `/4!/4/2` → `/6/4!/4/2`。
+        let mut indirection = parent.local.clone();
+        indirection.extend(endpoint.indirection.iter().cloned());
+        (indirection, endpoint.local.clone())
+    } else {
+        let mut local = parent.local.clone();
+        local.extend(endpoint.local.iter().cloned());
+        (parent.indirection.clone(), local)
+    };
+
     Ok(CfiPath::new(
-        parent.indirection.clone(),
+        indirection,
         local,
         endpoint.text_offset.or(parent.text_offset),
     ))
@@ -856,6 +891,16 @@ mod tests {
     }
 
     #[test]
+    fn range_endpoints_may_carry_the_only_indirection() {
+        // 跨内容文档范围：父路径只到 spine（没有 `!`），两个端点各自带 `!`。
+        // 按规范做字符串拼接：`/6` + `/4!/4/2` = `/6/4!/4/2`。
+        let cfi = Cfi::parse("epubcfi(/6,/4!/4/2,/6!/4/2:7)").unwrap();
+        let (start, end) = cfi.expand_range().unwrap().unwrap();
+        assert_eq!(start.to_string(), "/6/4!/4/2");
+        assert_eq!(end.to_string(), "/6/6!/4/2:7");
+    }
+
+    #[test]
     fn two_part_range_is_rejected() {
         // 规范**没有**两段式，epubcfi(a,b) 不是合法 range
         let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/10/2)").unwrap();
@@ -871,8 +916,8 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_with_own_indirection_is_reported_not_guessed() {
-        // 规范允许端点自带 `!`，但会引入二次跳转，本项目明确不支持。
+    fn double_indirection_in_range_is_reported_not_guessed() {
+        // 父路径已经带 `!`，端点再带 `!` 会拼出 `a!/b!/c`，语法上不成立。
         // 与其悄悄算错，不如报错。
         let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/2!/4,/4!/6)").unwrap();
         assert_eq!(

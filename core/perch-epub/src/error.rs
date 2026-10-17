@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+use crate::cfi::CfiError;
+use crate::xhtml::XhtmlError;
+
 /// EPUB 解析错误。
 ///
 /// 每个变体都提供稳定的 [`EpubError::code`]，供跨语言层映射为错误码：
@@ -30,6 +33,14 @@ pub enum EpubError {
     /// OPF 结构不合法（缺少必需内容）。
     #[error("OPF 内容不合法: {0}")]
     InvalidPackage(&'static str),
+
+    /// CFI 解析/校验失败。
+    #[error("CFI 非法: {0}")]
+    Cfi(#[from] CfiError),
+
+    /// XHTML 内容文档解析失败。
+    #[error("XHTML 解析失败: {0}")]
+    Xhtml(#[from] XhtmlError),
 }
 
 impl EpubError {
@@ -43,6 +54,8 @@ impl EpubError {
             Self::EntryNotFound(_) => "EPUB_ENTRY_NOT_FOUND",
             Self::Xml(_) => "EPUB_XML",
             Self::InvalidPackage(_) => "EPUB_INVALID_PACKAGE",
+            Self::Cfi(_) => "EPUB_CFI",
+            Self::Xhtml(_) => "EPUB_XHTML",
         }
     }
 }

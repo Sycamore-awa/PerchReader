@@ -179,7 +179,7 @@ pub struct Refinement {
     ///
     /// 只有 TXT 有这一项；EPUB 内嵌 XHTML 由规范要求 UTF-8，因此为 `None`。
     /// 值是**探测结果**而非保证——需要判断是否可信时，调用方可再走
-    /// `perch_txt::TxtDocument::from_bytes(...).meta().certain_encoding`。
+    /// `perch_txt::decode(...).certain()`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
     /// 封面在容器内的绝对路径（来自 `properties="cover-image"` 或 EPUB2 的
@@ -550,9 +550,10 @@ fn build_txt_book_text(decoded: &str, options: ExtractOptions) -> Result<BookTex
 
 /// 抽取整个 TXT 文件的正文与"章节"映射（阶段③的输入）。
 ///
-/// 编码由 [`perch_txt::TxtDocument`] 探测并解码（BOM → 合法 UTF-8 → `chardetng` 猜测）；
-/// 解码**不会失败**，非法序列会被替换为 U+FFFD。探测是否可信可看
-/// `TxtDocument::meta().certain_encoding`。
+/// 编码由 [`perch_txt::decode`] 探测并解码（BOM → 合法 UTF-8 → `chardetng` 猜测）；
+/// 解码**不会失败**，非法序列会被替换为 U+FFFD。这里只需要解码后的文本，
+/// 因此刻意**不**走 [`perch_txt::TxtDocument`]——那会顺带建立字符索引与行索引，
+/// 对导入阶段是白花的 CPU 和内存。探测是否可信可看 `perch_txt::decode(...).certain()`。
 ///
 /// TXT 没有篇章结构，因此整本书是**一个章节**：`href` 固定为 `txt:`，
 /// 区间为 `[0, 字符数)`。
@@ -572,8 +573,8 @@ fn build_txt_book_text(decoded: &str, options: ExtractOptions) -> Result<BookTex
 /// 解码 + 归一化后没有任何非空白字符（空文件、纯空白文件，或 `max_chars` 为 0
 /// 导致截断为空）时返回 [`JobsError::EmptyContent`]。
 pub fn extract_txt(bytes: &[u8], options: ExtractOptions) -> Result<BookText, JobsError> {
-    let document = perch_txt::TxtDocument::from_bytes(bytes);
-    build_txt_book_text(document.text(), options)
+    let decoded = perch_txt::decode(bytes);
+    build_txt_book_text(decoded.text(), options)
 }
 
 /// 阶段②：TXT 的"精修"。
@@ -583,14 +584,15 @@ pub fn extract_txt(bytes: &[u8], options: ExtractOptions) -> Result<BookText, Jo
 ///
 /// `char_count` 用归一化后正文的**非空白字符数**，与 EPUB 口径一致。
 /// `encoding` 给出 `perch-txt` 探测到的源编码名，供 UI 在乱码时提供"换个编码重读"。
+/// 与 [`extract_txt`] 一样只走 [`perch_txt::decode`]，不建无用的索引。
 ///
 /// # Errors
 ///
 /// 同 [`extract_txt`]：没有可读正文时返回 [`JobsError::EmptyContent`]。
 pub fn refine_txt(bytes: &[u8], options: ExtractOptions) -> Result<Refinement, JobsError> {
-    let document = perch_txt::TxtDocument::from_bytes(bytes);
-    let encoding = Some(document.meta().encoding.to_owned());
-    let book = build_txt_book_text(document.text(), options)?;
+    let decoded = perch_txt::decode(bytes);
+    let encoding = Some(decoded.encoding().to_owned());
+    let book = build_txt_book_text(decoded.text(), options)?;
     Ok(Refinement {
         title: None,
         author: None,

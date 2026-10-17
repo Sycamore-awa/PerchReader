@@ -57,6 +57,81 @@ pub struct TxtMeta {
     pub had_decode_errors: bool,
 }
 
+/// 只解码、**不建索引**的轻量结果。
+///
+/// [`TxtDocument`] 会在解码之外再建立字符索引与行索引；只关心"文本 + 编码"的调用方
+/// （如导入阶段算字数、抽正文）用 [`decode`] 即可，省掉这两份索引的 CPU 与内存。
+///
+/// 解码结果与 [`TxtDocument::from_bytes`] **逐字符一致**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct DecodedText {
+    text: String,
+    encoding: &'static str,
+    certain: bool,
+    had_decode_errors: bool,
+}
+
+impl DecodedText {
+    /// 实际使用的编码名（`encoding_rs` 的名字，如 `UTF-8` / `GBK` / `Big5`）。
+    #[must_use]
+    pub fn encoding(&self) -> &str {
+        self.encoding
+    }
+
+    /// 解码后的全文。
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// 编码是否**确定**（来自 BOM 或合法 UTF-8）。
+    ///
+    /// 为 `false` 时说明这是 [`chardetng`] 的猜测，UI 应当提供"换个编码重读"的入口。
+    /// 语义与 [`TxtMeta::certain_encoding`] 相同。
+    #[must_use]
+    pub fn certain(&self) -> bool {
+        self.certain
+    }
+
+    /// 解码时是否出现过非法序列（出现即说明编码可能选错了）。
+    #[must_use]
+    pub fn had_decode_errors(&self) -> bool {
+        self.had_decode_errors
+    }
+
+    fn from_detected(detected: Detected) -> Self {
+        Self {
+            text: detected.text,
+            encoding: detected.encoding,
+            certain: detected.certain,
+            had_decode_errors: detected.had_errors,
+        }
+    }
+
+    fn into_parts(self) -> (String, &'static str, bool, bool) {
+        (
+            self.text,
+            self.encoding,
+            self.certain,
+            self.had_decode_errors,
+        )
+    }
+}
+
+/// 探测编码并解码为文本，**不建**字符索引与行索引。
+///
+/// 适合"只要文本"的调用方（如导入阶段算字数、抽正文）。解码走的是与
+/// [`TxtDocument::from_bytes`] 完全相同的一条路径（BOM → 合法 UTF-8 →
+/// [`chardetng`] 猜测），因此两者得到的文本逐字符一致；区别只是本函数
+/// 不会建立字符索引与行索引。
+///
+/// 解码**永远不会失败**（非法序列会被替换为 U+FFFD），是否出现过替换可看
+/// [`DecodedText::had_decode_errors`]。
+pub fn decode(bytes: &[u8]) -> DecodedText {
+    DecodedText::from_detected(detect_and_decode(bytes))
+}
+
 /// 一个纯文本文档。
 pub struct TxtDocument {
     text: String,
@@ -83,13 +158,14 @@ impl TxtDocument {
     /// 是否出现过替换可以从 [`TxtMeta::had_decode_errors`] 看出来。
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let detected = detect_and_decode(bytes);
+        // 解码路径与 `decode` 共用，保证两者结果逐字符一致；差异只在之后的建索引。
+        let (text, encoding, certain_encoding, had_decode_errors) = decode(bytes).into_parts();
         Self::assemble(
-            detected.text.into_owned(),
-            detected.encoding,
-            detected.certain,
+            text,
+            encoding,
+            certain_encoding,
             bytes.len(),
-            detected.had_errors,
+            had_decode_errors,
         )
     }
 
@@ -385,7 +461,7 @@ fn build_line_starts(text: &str) -> Vec<u64> {
 
 /// 编码探测与解码的结果。
 struct Detected {
-    text: std::borrow::Cow<'static, str>,
+    text: String,
     /// 编码名（`encoding_rs` 的名字）
     encoding: &'static str,
     /// 编码是否确定（BOM / 合法 UTF-8 / 用户指定）——否则是探测器的猜测。
@@ -400,7 +476,7 @@ fn detect_and_decode(bytes: &[u8]) -> Detected {
     if let Some((encoding, _)) = Encoding::for_bom(bytes) {
         let (text, _, had_errors) = encoding.decode(bytes);
         return Detected {
-            text: std::borrow::Cow::Owned(text.into_owned()),
+            text: text.into_owned(),
             encoding: encoding.name(),
             certain: true,
             had_errors,
@@ -410,7 +486,7 @@ fn detect_and_decode(bytes: &[u8]) -> Detected {
     // 2) 合法 UTF-8 基本可以确定（GBK 中文很难恰好构成合法 UTF-8）
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Detected {
-            text: std::borrow::Cow::Owned(text.to_owned()),
+            text: text.to_owned(),
             encoding: encoding_rs::UTF_8.name(),
             certain: true,
             had_errors: false,
@@ -427,7 +503,7 @@ fn detect_and_decode(bytes: &[u8]) -> Detected {
     let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     let (text, _, had_errors) = encoding.decode(bytes);
     Detected {
-        text: std::borrow::Cow::Owned(text.into_owned()),
+        text: text.into_owned(),
         encoding: encoding.name(),
         certain: false,
         had_errors,
@@ -686,5 +762,117 @@ mod tests {
         // 边界处不应越界
         let (before, _, _) = doc.context_around(0..2, 10).unwrap();
         assert_eq!(before, "");
+    }
+
+    #[test]
+    fn decode_matches_document_for_utf8_bom_gbk_and_ascii() {
+        // GBK 需要足够长的样本才能被探测稳定识别（与 detects_gbk_for_long_chinese_text 同理）
+        let gbk_original =
+            "中文测试，这是一段足够长的文本用来让编码探测器有足够的依据。".repeat(20);
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode(&gbk_original);
+        let mut bom_bytes = UTF8_BOM.to_vec();
+        bom_bytes.extend_from_slice("带 BOM 的文本".as_bytes());
+        let ascii_bytes = b"plain ascii text, no non-ascii bytes\n".to_vec();
+
+        let cases: [(&str, &[u8]); 4] = [
+            ("utf8", "你好，世界".as_bytes()),
+            ("utf8-bom", &bom_bytes),
+            ("gbk", &gbk_bytes),
+            ("ascii", &ascii_bytes),
+        ];
+        for (name, bytes) in cases {
+            let decoded = decode(bytes);
+            let doc = TxtDocument::from_bytes(bytes);
+            assert_eq!(
+                decoded.text(),
+                doc.text(),
+                "case={name}: 解码文本必须逐字符一致"
+            );
+            assert_eq!(
+                decoded.encoding(),
+                doc.meta().encoding,
+                "case={name}: 编码名必须一致"
+            );
+            assert_eq!(
+                decoded.certain(),
+                doc.meta().certain_encoding,
+                "case={name}: 确定性必须一致"
+            );
+            assert_eq!(
+                decoded.had_decode_errors(),
+                doc.meta().had_decode_errors,
+                "case={name}: 解码错误标记必须一致"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_reports_certainty() {
+        // BOM / 合法 UTF-8 / 纯 ASCII 都是确定的
+        assert!(decode("纯 UTF-8 中文".as_bytes()).certain());
+        assert!(decode(b"pure ascii").certain());
+
+        let mut bom = UTF8_BOM.to_vec();
+        bom.extend_from_slice(b"bom");
+        assert!(decode(&bom).certain());
+
+        // 需要猜的编码（GBK）不应被标为确定
+        let original = "中文测试，这是一段足够长的文本用来让编码探测器有足够的依据。".repeat(20);
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode(&original);
+        assert!(!decode(&gbk_bytes).certain());
+    }
+
+    #[test]
+    fn decode_handles_empty_input_like_document() {
+        let decoded = decode(b"");
+        let doc = TxtDocument::from_bytes(b"");
+        assert_eq!(decoded.text(), "");
+        assert_eq!(decoded.text(), doc.text());
+        assert_eq!(decoded.encoding(), doc.meta().encoding);
+    }
+
+    /// 性能参考（不是断言）：5MB 量级文本下比较 `decode` 与 `TxtDocument::from_bytes`。
+    ///
+    /// 用 `cargo test -p perch-txt -- --nocapture` 查看打印结果。debug 构建的数字
+    /// 只适合看数量级；不同机器差异很大，因此这里**不做任何性能断言**。
+    #[test]
+    fn decode_performance_reference() {
+        fn best_of_three(mut run: impl FnMut() -> usize) -> std::time::Duration {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                let value = run();
+                let elapsed = start.elapsed();
+                std::hint::black_box(value);
+                best = best.min(elapsed);
+            }
+            best
+        }
+
+        // 每行都带中文与换行，确保字符索引和行索引都有实际工作量
+        let unit = "第一章 中文测试文本 with ASCII words\n";
+        let repeats = (5 * 1024 * 1024) / unit.len();
+        let bytes = unit.repeat(repeats).into_bytes();
+
+        // 先验证结果一致，再测耗时
+        let decoded = decode(&bytes);
+        let doc = TxtDocument::from_bytes(&bytes);
+        assert_eq!(decoded.text(), doc.text());
+
+        let decode_time = best_of_three(|| decode(&bytes).text().len());
+        let document_time = best_of_three(|| TxtDocument::from_bytes(&bytes).text().len());
+        let ratio = document_time.as_secs_f64() / decode_time.as_secs_f64().max(f64::MIN_POSITIVE);
+        let mib = bytes.len() as f64 / (1024.0 * 1024.0);
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+
+        println!(
+            "[perf] TXT {} bytes ({mib:.1} MiB, {profile} build): decode={decode_time:?}, \
+             TxtDocument::from_bytes={document_time:?}, from_bytes/decode={ratio:.2}x",
+            bytes.len()
+        );
     }
 }
