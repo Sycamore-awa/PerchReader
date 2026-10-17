@@ -19,7 +19,7 @@
 use std::borrow::Cow;
 
 use quick_xml::XmlVersion;
-use quick_xml::events::BytesStart;
+use quick_xml::events::{BytesEnd, BytesStart};
 
 /// 取名字中前缀之后的部分（`dc:title` → `title`）。
 pub(crate) fn local_name(raw: &str) -> &str {
@@ -32,6 +32,23 @@ pub(crate) fn local_name(raw: &str) -> &str {
 /// 元素本地名是否为 `name`。
 pub(crate) fn is(element: &BytesStart<'_>, name: &str) -> bool {
     local_name(element.name().into_inner()) == name
+}
+
+/// 结束标签的本地名（`BytesEnd` 与 `BytesStart` 是不同类型，需要单独一个函数）。
+///
+/// 与 [`name_of`] 同理：`BytesEnd::name()` 返回**按值**的 `QName`（临时值），
+/// 必须用 `into_inner()` 取出内部的 `&str` 才能安全返回。
+pub(crate) fn end_name<'element>(element: &'element BytesEnd<'_>) -> &'element str {
+    local_name(element.name().into_inner())
+}
+
+/// 把 XML 文本片段做实体反转义。
+///
+/// 失败时退化为原文：个别畸形实体不该毁掉整次解析。
+pub(crate) fn decode_text(raw: &str) -> String {
+    quick_xml::escape::unescape(raw)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| raw.to_owned())
 }
 
 /// 元素的本地名（调用方通常紧接着 `match`，因此返回借用）。
