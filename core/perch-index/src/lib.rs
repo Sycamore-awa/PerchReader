@@ -53,6 +53,8 @@
 //!   应逐本建好后落盘（持久化格式尚未实现，见下一步）
 //! - 未实现前缀/模糊匹配
 
+pub mod persist;
+
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -254,6 +256,49 @@ impl Index {
             tokens: self.postings.len(),
             postings: self.postings.values().map(Vec::len).sum(),
             chars: self.char_count(),
+        }
+    }
+
+    /// 索引覆盖的正文。
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// 正文的原始字节（供序列化使用）。
+    #[must_use]
+    pub(crate) fn text_bytes(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
+
+    /// 倒排表（供序列化使用）。
+    #[must_use]
+    pub(crate) fn postings_map(&self) -> &HashMap<String, Vec<u32>> {
+        &self.postings
+    }
+
+    /// 由已解析的各部分重建索引（供加载使用，**不重新分词**）。
+    ///
+    /// 加载时直接复用磁盘上的倒排，避免对整本书再做一次 O(n) 的分词——
+    /// 这正是"索引落盘"的意义所在。
+    pub(crate) fn from_parts(
+        text: String,
+        chunk_chars: u64,
+        char_count: u64,
+        postings: HashMap<String, Vec<u32>>,
+    ) -> Self {
+        let mut chunks = Vec::new();
+        let mut start = 0u64;
+        while start < char_count {
+            let end = (start + chunk_chars).min(char_count);
+            chunks.push(start..end);
+            start = end;
+        }
+        Self {
+            text,
+            chunk_chars,
+            chunks,
+            postings,
         }
     }
 
