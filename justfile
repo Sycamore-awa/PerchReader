@@ -62,9 +62,11 @@ spike-web-setup:
 app-web:
     cd app && flutter build web --release
 
-# 静态分析
+# Dart 静态分析
+# 注意：这里用 dart analyze 而不是 flutter analyze —— 后者在含中文的项目路径下会
+# 抛 FormatException（LSP 通道按字节/字符算错 Content-Length），见 docs/03 环境怪癖
 app-analyze:
-    cd app && flutter analyze
+    cd app && dart analyze
 
 # 无头浏览器跑一遍并抓运行时日志（无需图形界面，CI 也能用）
 # 用法：先起服务器（python3 -m http.server 8099 -d app/build/web），再跑这个
