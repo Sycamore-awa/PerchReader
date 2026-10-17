@@ -236,7 +236,10 @@ jobs:
       - name: 断言 Rust 符号已链入 App 二进制
         run: |
           set -o pipefail
-          binary=$(find app/build/ios/iphonesimulator -maxdepth 2 -name Runner -type f | head -1)
+          # 注意 `| head -1`：head 提前关管道会让 find 收到 SIGPIPE，
+          # 在 pipefail + bash -e 下赋值语句直接失败——诊断一行都打不出来。
+          # 加 `|| true` 兜住。（同类坑见 docs/03 §九 的 grep -q 案例）
+          binary=$(find app/build/ios/iphonesimulator -maxdepth 2 -name Runner -type f 2>/dev/null | head -1 || true)
           if [ -z "$binary" ]; then
             echo "::error::找不到 Runner 可执行文件"
             exit 1
