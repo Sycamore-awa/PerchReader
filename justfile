@@ -36,13 +36,38 @@ check-ios-sim:
     cd core && cargo check --workspace --target x86_64-apple-ios
 
 # 产出 iOS 静态库（Linux 上可产出 .a，链接成 App 仍需 macOS）
+# 编译 iOS 静态库
+# 必须用 `cargo rustc --crate-type staticlib` 而不是 `cargo build`：
+# perch-ffi 声明了 cdylib + staticlib + rlib，而 cdylib 需要链接器，
+# Linux 上的 cc 不认识 `-target arm64-apple-ios` → 整个 build 会报错退出。
+# staticlib 只是打包 .a，不需要链接器，因此覆盖 crate-type 即可。
 build-ios-lib:
-    cd core && cargo build -p perch-ffi --release --target aarch64-apple-ios
+    cd core && cargo rustc -p perch-ffi --release --target aarch64-apple-ios --crate-type staticlib
+
+# 断言 iOS 静态库导出了 FFI 符号（docs/09 §D.5 的零成本检查）
+# T = 全局可导出；若变成 t（局部）或 U（未定义），DynamicLibrary.process() 运行时找不到符号
+ios-symbols: build-ios-lib
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lib=core/target/aarch64-apple-ios/release/libperch_ffi.a
+    nm_bin=$(command -v llvm-nm || command -v nm)
+    # 先整体取出符号表再比较：**不能**写成 `nm ... | grep -q`。
+    # grep -q 命中后立即退出会关掉管道，nm 收到 SIGPIPE 而非零退出，
+    # 在 set -o pipefail 下整个管道被判失败 —— 表现为"匹配成功却报失败"。
+    symbols=$("$nm_bin" --defined-only -g "$lib" 2>/dev/null)  # 2>/dev/null: 屏蔽空目标文件的 "no symbols" 噪声
+    for symbol in _perch_call _perch_string_free; do
+      if ! grep -q "T $symbol$" <<<"$symbols"; then
+        echo "!! iOS 静态库缺少全局导出符号 $symbol" >&2
+        echo "   （若成为 t/U，链接进 App 后 DynamicLibrary.process() 会解析失败）" >&2
+        exit 1
+      fi
+      echo "✓ $symbol 是全局导出符号"
+    done
 
 # ---- 组合任务 ----
 
 # 本地 CI：提交前跑这个
-ci: fmt-check lint test check-ios check-ios-sim
+ci: fmt-check lint test check-ios check-ios-sim ios-symbols
 
 # 快速回路
 quick: fmt lint test

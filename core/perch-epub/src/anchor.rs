@@ -61,6 +61,12 @@ pub struct Anchored {
     pub whitespace_tolerant: bool,
 }
 
+/// 上下文最多取多少字符（对齐 Hypothesis 的 `contextLen = 32`）。
+///
+/// 前文越长，越容易在无关区域"碰巧"匹配；固定上限把误命中率压下来。
+/// Hypothesis 的注释也承认这是权宜之计（理想做法是按段落/文章边界截断）。
+pub const CONTEXT_CHARS: usize = 32;
+
 /// 置信度下限。低于它的结果一律丢弃。
 ///
 /// 0.6 的含义：至少要有"正好命中原文 + 一点上下文佐证"，
@@ -72,13 +78,31 @@ pub const MIN_CONFIDENCE: f32 = 0.6;
 /// `document` 是内容文档的**纯文本**（由 `XhtmlIndex` 拼接各文本节点得到）。
 #[must_use]
 pub fn reanchor(document: &str, query: &AnchorQuery<'_>) -> Option<Anchored> {
+    reanchor_with_hint(document, query, None)
+}
+
+/// 带**位置先验**的重定位。
+///
+/// `hint` 是一个大致字符偏移（由 CFI 或 progression 换算而来），用作
+/// **平局裁决**：当同一段文字在正文里出现多次、而上下文又不足以区分时，
+/// 靠近 `hint` 的那个候选胜出。
+///
+/// 这一项来自 Hypothesis 的做法（`TextPositionSelector` → `TextQuoteSelector`
+/// 的 hint，权重仅 2/92 ≈ 2.2%）。权重很弱，但恰好够用来打破平局——
+/// 而"同一句话出现两次"正是真实语料里最常见的歧义来源。
+#[must_use]
+pub fn reanchor_with_hint(
+    document: &str,
+    query: &AnchorQuery<'_>,
+    hint: Option<u64>,
+) -> Option<Anchored> {
     let highlight = query.highlight.trim();
     if highlight.is_empty() || document.is_empty() {
         return None;
     }
 
     // 先试精确匹配
-    if let Some(found) = match_exact(document, highlight, query) {
+    if let Some(found) = match_exact(document, highlight, query, hint) {
         return Some(found);
     }
 
@@ -87,7 +111,12 @@ pub fn reanchor(document: &str, query: &AnchorQuery<'_>) -> Option<Anchored> {
 }
 
 /// 精确匹配：找出所有出现位置并按上下文打分。
-fn match_exact(document: &str, highlight: &str, query: &AnchorQuery<'_>) -> Option<Anchored> {
+fn match_exact(
+    document: &str,
+    highlight: &str,
+    query: &AnchorQuery<'_>,
+    hint: Option<u64>,
+) -> Option<Anchored> {
     let mut best: Option<Anchored> = None;
     let occurrences: Vec<usize> = document
         .match_indices(highlight)
@@ -100,7 +129,14 @@ fn match_exact(document: &str, highlight: &str, query: &AnchorQuery<'_>) -> Opti
             .map(|prefix| prefix.chars().count() as u64)
             .unwrap_or(0);
         let char_end = char_start + highlight.chars().count() as u64;
-        let confidence = score(document, char_start, char_end, query, occurrences.len());
+        let confidence = score(
+            document,
+            char_start,
+            char_end,
+            query,
+            occurrences.len(),
+            hint,
+        );
         let candidate = Anchored {
             range: char_start..char_end,
             confidence,
@@ -118,53 +154,90 @@ fn match_exact(document: &str, highlight: &str, query: &AnchorQuery<'_>) -> Opti
 
 /// 计算某个候选位置的置信度。
 ///
-/// 构成：
-/// - 命中原文本身：基础分
-/// - 前文/后文的吻合比例：加分（这是区分多个候选的关键）
-/// - 如果整个文档里只有一个候选，且没有上下文可用：给一个中等偏高的分
+/// # 证据模型
+///
+/// 四个证据项，每项权重相同（0.25），"命中原文"本身占 0.5 作为基础：
+///
+/// | 证据 | 含义 |
+/// |---|---|
+/// | 命中原文 | 必然成立（候选就是这么来的），给 0.5 |
+/// | 前文吻合 | 紧贴标注之前的 32 字符，从尾往前比 |
+/// | 后文吻合 | 紧贴标注之后的 32 字符，从头往后比 |
+/// | 位置先验 | 候选离 `hint` 越近越可信 |
+///
+/// 若**除原文外没有任何其它证据**（既无上下文也无 hint），则退回"唯一性"判断：
+/// 全文只出现一次 → 0.8，出现多次 → 0.4（低于阈值被丢弃）。
+///
+/// # 与 Hypothesis 的差异（有意为之）
+///
+/// Hypothesis 用 50/20/20/2 的线性加权，其中 quote 项是
+/// `1 - errors/len`（基于编辑距离的连续值）。我们的 quote 项是**二值**的
+/// （精确命中或不做），所以直接套用 50/92 会让"精确命中"占 54%，
+/// 与"编辑距离允许一半字符出错"的语义不可比。因此改用等权重结构：
+/// 保留它"四类证据 + hint 作先验"的**结构**，不照搬不可比的**数值**。
 fn score(
     document: &str,
     char_start: u64,
     char_end: u64,
     query: &AnchorQuery<'_>,
     occurrence_count: usize,
+    hint: Option<u64>,
 ) -> f32 {
-    let before = query.before.unwrap_or("").trim_end();
-    let after = query.after.unwrap_or("").trim_start();
+    let before = truncate_context(query.before.unwrap_or("").trim_end(), true);
+    let after = truncate_context(query.after.unwrap_or("").trim_start(), false);
 
-    // 基础分：命中原文是真的，但只靠它无法排除"出现在别处"
-    let mut score = 0.5f32;
-    let mut context_used = false;
+    let mut evidence = 0.5f32; // 命中原文
+    let mut terms = 1usize;
 
     if !before.is_empty() {
-        // 前文：紧贴标注**之前**的文字，应当从尾部往前比
-        let expected: Vec<char> = before.chars().collect();
-        let actual_start = char_start.saturating_sub(expected.len() as u64);
+        // 前文：紧贴标注**之前**的文字，从尾部往前比
+        let actual_start = char_start.saturating_sub(before.len() as u64);
         let actual: Vec<char> = slice_chars(document, actual_start..char_start)
             .chars()
             .collect();
-        score += 0.25 * trailing_agreement(&expected, &actual);
-        context_used = true;
+        evidence += 0.25 * trailing_agreement(&before, &actual);
+        terms += 1;
     }
+
     if !after.is_empty() {
-        // 后文：紧贴标注**之后**的文字，应当从头往后比
-        // （早先这里错用了从尾比较的 agreement，导致所有带后文的候选都拿不到加分）
-        let expected: Vec<char> = after.chars().collect();
+        // 后文：紧贴标注**之后**的文字，从头往后比
         let total = document.chars().count() as u64;
-        let end = (char_end + expected.len() as u64).min(total);
+        let end = (char_end + after.len() as u64).min(total);
         let actual: Vec<char> = slice_chars(document, char_end..end).chars().collect();
-        score += 0.25 * leading_agreement(&expected, &actual);
-        context_used = true;
+        evidence += 0.25 * leading_agreement(&after, &actual);
+        terms += 1;
     }
 
-    // 没有上下文可用时的处理：
-    // - 全文只出现一次 → 唯一解，可信
-    // - 出现多次 → 无法区分，压低置信度（靠阈值把它过滤掉）
-    if !context_used {
-        score = if occurrence_count == 1 { 0.8 } else { 0.4 };
+    if let Some(hint) = hint {
+        let doc_len = document.chars().count().max(1) as f32;
+        let distance = (char_start as f32 - hint as f32).abs();
+        let proximity = (1.0 - distance / doc_len).clamp(0.0, 1.0);
+        evidence += 0.25 * proximity;
+        terms += 1;
     }
 
-    score.min(1.0)
+    // 退化情形：只有"命中原文"这一项证据
+    if terms == 1 {
+        evidence = if occurrence_count == 1 { 0.8 } else { 0.4 };
+    }
+
+    evidence.min(1.0)
+}
+
+/// 把上下文截到 [`CONTEXT_CHARS`]，并保持贴合标注的那一侧完整。
+///
+/// `take_tail = true` 用于前文（保留靠近标注的结尾部分），
+/// `false` 用于后文（保留靠近标注的开头部分）。
+fn truncate_context(text: &str, take_tail: bool) -> Vec<char> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= CONTEXT_CHARS {
+        return chars;
+    }
+    if take_tail {
+        chars[chars.len() - CONTEXT_CHARS..].to_vec()
+    } else {
+        chars[..CONTEXT_CHARS].to_vec()
+    }
 }
 
 /// 忽略空白差异的匹配。
@@ -461,6 +534,90 @@ mod tests {
         assert!((leading_agreement(&chars("abc"), &chars("abcx")) - 1.0).abs() < 1e-6);
         assert!((leading_agreement(&chars("abc"), &chars("xabc")) - 0.0).abs() < 1e-6);
         assert!((leading_agreement(&chars("abc"), &chars("ab")) - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    // ---- position hint（对齐 Hypothesis 的 TextPositionSelector 先验）----
+
+    #[test]
+    fn hint_disambiguates_repeated_text_without_context() {
+        // 同一句话出现两次、没有上下文 —— 单靠 reanchor 会被丢弃
+        let query = AnchorQuery {
+            highlight: "灯塔的守夜人合上书",
+            before: None,
+            after: None,
+        };
+        assert!(reanchor(DOC, &query).is_none(), "无 hint 时应保守放弃");
+
+        // 第一次出现的字符偏移是 11（"第一章。天亮了，" 之后）
+        let first_at = DOC.find("灯塔的守夜人合上书").unwrap();
+        let first_char = DOC[..first_at].chars().count() as u64;
+
+        // 给出指向第一次出现的 hint → 采纳，且选中的是第一次
+        let found = reanchor_with_hint(DOC, &query, Some(first_char)).expect("有 hint 时应能定位");
+        assert_eq!(found.range.start, first_char);
+        assert!(found.confidence >= 0.6, "置信度={}", found.confidence);
+
+        // 指向第二次出现的 hint → 选中第二次
+        let second_byte = DOC[first_at + "灯塔的守夜人合上书".len()..]
+            .find("灯塔的守夜人合上书")
+            .unwrap()
+            + first_at
+            + "灯塔的守夜人合上书".len();
+        let second_char = DOC[..second_byte].chars().count() as u64;
+        let found = reanchor_with_hint(DOC, &query, Some(second_char)).unwrap();
+        assert_eq!(found.range.start, second_char);
+    }
+
+    #[test]
+    fn context_outweighs_a_misleading_hint() {
+        // 上下文明确指向第二次出现，但 hint 指向很远的开头
+        let query = AnchorQuery {
+            highlight: "灯塔的守夜人合上书",
+            before: None,
+            after: Some("。然后他睡了"),
+        };
+        let found = reanchor_with_hint(DOC, &query, Some(0)).unwrap();
+        let after_start = found.range.end;
+        let after = slice_chars(DOC, after_start..(after_start + 5));
+        assert!(
+            after.starts_with("。然后他"),
+            "上下文应当胜过仅有 0.25 权重的 hint，实际后文={after}"
+        );
+    }
+
+    #[test]
+    fn long_context_is_truncated_to_the_side_touching_the_quote() {
+        // 前文超过 32 字符：应保留**紧贴标注的结尾部分**，而不是开头
+        let long_before = format!("{}灯塔的守夜人合上书。", "无关的废话".repeat(20));
+        let document = format!("{long_before}海风很大。后文");
+        let query = AnchorQuery {
+            highlight: "海风很大",
+            // 传完整的长前文，内部会截断
+            before: Some(&long_before),
+            after: Some("。后文"),
+        };
+        let found = reanchor(&document, &query).unwrap();
+        assert_eq!(&slice_chars(&document, found.range.clone()), "海风很大");
+        assert!(
+            found.confidence > 0.9,
+            "截断后仍应完整吻合紧贴部分，置信度={}",
+            found.confidence
+        );
+    }
+
+    #[test]
+    fn truncate_context_keeps_the_near_side() {
+        let text = "0123456789".repeat(10); // 100 字符
+        let tail = truncate_context(&text, true);
+        let head = truncate_context(&text, false);
+        assert_eq!(tail.len(), CONTEXT_CHARS);
+        assert_eq!(head.len(), CONTEXT_CHARS);
+        // 前文保留结尾：最后一个是 '9'
+        assert_eq!(*tail.last().unwrap(), '9');
+        // 后文保留开头：第一个是 '0'
+        assert_eq!(head[0], '0');
+        // 短文本不截断
+        assert_eq!(truncate_context("短", true).len(), 1);
     }
 
     #[test]

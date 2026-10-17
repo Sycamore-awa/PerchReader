@@ -79,7 +79,9 @@ void main(List<String> args) {
   core.validateLocator({
     'href': '/OEBPS/c1.xhtml',
     'type': 'application/xhtml+xml',
-    'locations': {'progression': 0.42, 'partialCfi': '/6/4!/4/2'},
+    // partialCfi 按 Readium 契约是 `!` 右侧的片段，不含 spine 引用与 epubcfi() 包装
+    // （见 docs/09 §C.2）。写成 '/6/4!/4/2' 会被当非法值。
+    'locations': {'progression': 0.42, 'partialCfi': '/4/2'},
   });
   checkTrue('合法 Locator 通过校验', true);
 

@@ -91,6 +91,14 @@ pub enum CfiError {
     /// 语义校验：字符节点（奇数索引）后面不能再有子路径段。
     #[error("第 {position} 段是字符节点（索引 {index}），字符节点不能有子节点")]
     CharacterStepNotLast { position: usize, index: u32 },
+
+    /// 范围 CFI 的段数不合法。规范只允许 1 段（点）或 3 段（父, 起, 止）。
+    #[error("范围 CFI 必须是 3 段（父, 起, 止），实际 {0} 段")]
+    RangeArity(usize),
+
+    /// 范围 CFI 的 start/end 自带 `!` 间接引用。规范允许，但本项目暂不处理。
+    #[error("范围 CFI 的 start/end 自带 ! 间接引用，暂不支持")]
+    NestedRangeIndirection,
 }
 
 impl CfiError {
@@ -110,6 +118,8 @@ impl CfiError {
             Self::InvalidOffset(_) => "CFI_INVALID_OFFSET",
             Self::MultipleIndirections => "CFI_MULTIPLE_INDIRECTIONS",
             Self::CharacterStepNotLast { .. } => "CFI_CHARACTER_STEP_NOT_LAST",
+            Self::RangeArity(_) => "CFI_RANGE_ARITY",
+            Self::NestedRangeIndirection => "CFI_NESTED_RANGE_INDIRECTION",
         }
     }
 }
@@ -346,6 +356,50 @@ impl Cfi {
     #[must_use]
     pub fn primary(&self) -> Option<&CfiPath> {
         self.parts.first()
+    }
+
+    /// 把**范围 CFI** 展开成 (起点, 终点) 两条点定位路径。
+    ///
+    /// # 规范依据
+    ///
+    /// IDPF CFI 规范原文：
+    ///
+    /// > "A range is a path followed by **two local (or relative) paths** that identify the start
+    /// > and end of the range. ... **each start and end subpath must be concatenated to the parent
+    /// > path** to create the start location path (PS) and end location path (PE)."
+    ///
+    /// 所以展开就是**字符串拼接**：
+    ///
+    /// ```text
+    /// epubcfi( /6/4!/4/2 , /10/2 , /12/4 )
+    ///          └─ parent ─┘  └start┘  └ end┘
+    /// start = /6/4!/4/2 + /10/2 = /6/4!/4/2/10/2
+    /// end   = /6/4!/4/2 + /12/4 = /6/4!/4/2/12/4
+    /// ```
+    ///
+    /// **不要**自己去想"共同祖先可以省略"之类的优化——规范没有这种说法。
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(None)`：这是点定位（单段），没有范围可展开
+    /// - `Ok(Some((start, end)))`：展开后的两条路径
+    ///
+    /// # Errors
+    ///
+    /// - [`CfiError::RangeArity`]：段数不是 1 或 3。
+    ///   **规范没有两段式**，`epubcfi(a,b)` 不是合法 range。
+    /// - [`CfiError::NestedRangeIndirection`]：start/end 自带 `!`（规范允许，本项目暂不支持）
+    pub fn expand_range(&self) -> Result<Option<(Self, Self)>, CfiError> {
+        match self.parts.len() {
+            1 => Ok(None),
+            3 => {
+                let parent = &self.parts[0];
+                let start = concat_path(parent, &self.parts[1])?;
+                let end = concat_path(parent, &self.parts[2])?;
+                Ok(Some((Self::point(start), Self::point(end))))
+            }
+            other => Err(CfiError::RangeArity(other)),
+        }
     }
 
     /// 对每一段做奇偶语义校验。
@@ -586,6 +640,26 @@ fn unescape_assertion(raw: &str) -> Result<String, CfiError> {
     Ok(out)
 }
 
+/// 把范围 CFI 的一个端点局部路径**拼接**到父路径上（规范要求的"字符串拼接"语义）。
+///
+/// - 间接引用（`!` 之前）沿用父路径的
+/// - 局部路径段 = 父的局部段 ++ 端点自己的局部段
+/// - 字符偏移优先取端点自己的
+fn concat_path(parent: &CfiPath, endpoint: &CfiPath) -> Result<CfiPath, CfiError> {
+    if !endpoint.indirection.is_empty() {
+        // 规范允许端点自带 `!`，但那会引入二次跳转，本项目暂不处理。
+        // 与其悄悄算错，不如明确报错。
+        return Err(CfiError::NestedRangeIndirection);
+    }
+    let mut local = parent.local.clone();
+    local.extend(endpoint.local.iter().cloned());
+    Ok(CfiPath::new(
+        parent.indirection.clone(),
+        local,
+        endpoint.text_offset.or(parent.text_offset),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -749,5 +823,61 @@ mod tests {
         // 第二个冒号会落到偏移解析里，必须报错而不是被忽略
         let error = Cfi::parse("/6/4!/4/2:1:2").unwrap_err();
         assert_eq!(error.code(), "CFI_INVALID_OFFSET");
+    }
+
+    // ---- 范围 CFI 展开（规范：端点路径与父路径**字符串拼接**）----
+
+    #[test]
+    fn point_cfi_has_no_range_to_expand() {
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2)").unwrap();
+        assert_eq!(cfi.expand_range().unwrap(), None);
+    }
+
+    #[test]
+    fn range_is_expanded_by_concatenation() {
+        // 规范示例形状：父 /6/4!/4/2，起 /10/2，止 /12/4
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/10/2,/12/4)").unwrap();
+        assert!(cfi.is_range());
+        let (start, end) = cfi.expand_range().unwrap().unwrap();
+        assert_eq!(start.parts.len(), 1, "展开后应是点定位");
+        assert_eq!(end.parts.len(), 1);
+        // 拼接结果：/6/4!/4/2/10/2 与 /6/4!/4/2/12/4
+        assert_eq!(start.to_string(), "/6/4!/4/2/10/2");
+        assert_eq!(end.to_string(), "/6/4!/4/2/12/4");
+    }
+
+    #[test]
+    fn range_endpoint_may_be_offset_only() {
+        // 规范：local_path 的 {step} 允许零个，因此端点可以只有字符偏移
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/1:3,/1:9)").unwrap();
+        let (start, end) = cfi.expand_range().unwrap().unwrap();
+        assert_eq!(start.to_string(), "/6/4!/4/2/1:3");
+        assert_eq!(end.to_string(), "/6/4!/4/2/1:9");
+    }
+
+    #[test]
+    fn two_part_range_is_rejected() {
+        // 规范**没有**两段式，epubcfi(a,b) 不是合法 range
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/10/2)").unwrap();
+        let error = cfi.expand_range().unwrap_err();
+        assert_eq!(error.code(), "CFI_RANGE_ARITY");
+        assert_eq!(error, CfiError::RangeArity(2));
+    }
+
+    #[test]
+    fn four_part_range_is_rejected() {
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/1,/2,/3)").unwrap();
+        assert_eq!(cfi.expand_range().unwrap_err(), CfiError::RangeArity(4));
+    }
+
+    #[test]
+    fn endpoint_with_own_indirection_is_reported_not_guessed() {
+        // 规范允许端点自带 `!`，但会引入二次跳转，本项目明确不支持。
+        // 与其悄悄算错，不如报错。
+        let cfi = Cfi::parse("epubcfi(/6/4!/4/2,/2!/4,/4!/6)").unwrap();
+        assert_eq!(
+            cfi.expand_range().unwrap_err().code(),
+            "CFI_NESTED_RANGE_INDIRECTION"
+        );
     }
 }
