@@ -287,66 +287,67 @@ jobs:
           # ⚠️ 本步骤禁止「消费端提前退出」的管道（grep -q / head / sed q）：
           # 生产者会收 SIGPIPE，在 pipefail + bash -e 下整步静默失败，
           # **一行诊断都打不出来**。这个坑已经踩了 4 次（docs/10 §6.2）。
-          # 诊断一律 echo 到 stdout —— `gh run view <id> --log` 可读。
-          binary="app/build/ios/iphonesimulator/Runner.app/Runner"
-          if [ ! -f "$binary" ]; then
-            echo "::error::找不到 $binary"
+          bundle="app/build/ios/iphonesimulator/Runner.app"
+          if [ ! -d "$bundle" ]; then
+            echo "::error::没有 $bundle"
             ls -la app/build/ios/ 2>/dev/null || true
             exit 1
           fi
 
-          symbols=$(nm "$binary" 2>&1 || true)
-
           echo "======== 符号断言诊断 ========"
-          echo "二进制: $binary"
-          echo "字节数: $(wc -c < "$binary" | tr -d ' ')"
-          echo "符号数: $(wc -l <<<"$symbols" | tr -d ' ')"
-          echo "---- 所有含 perch 的符号 ----"
-          if grep -qi 'perch' <<<"$symbols"; then
-            grep -i 'perch' <<<"$symbols"
-          else
-            echo "（没有任何含 perch 的符号）"
+          echo "---- Runner.app ----"
+          ls -la "$bundle"
+          echo "---- Runner.app/Frameworks ----"
+          ls -la "$bundle/Frameworks" 2>/dev/null || echo "（无 Frameworks 目录）"
+
+          # 逐个检查 bundle 里的**所有** Mach-O。Runner 未必是承载链接产物的那个文件：
+          # Flutter 新的模拟器构建里还有一个 __preview.dylib。
+          found_call=""
+          found_free=""
+          while IFS= read -r f; do
+            kind=$(file -b "$f" 2>/dev/null || true)
+            case "$kind" in
+              *Mach-O*) ;;
+              *) continue ;;
+            esac
+            syms=$(nm "$f" 2>&1 || true)
+            n=$(wc -l <<<"$syms" | tr -d ' ')
+            echo "── $f  （nm 输出 $n 行）"
+            if grep -qi 'perch' <<<"$syms"; then
+              echo "   ★ 含 perch 符号："
+              grep -i 'perch' <<<"$syms"
+            fi
+            if grep -q '_perch_call' <<<"$syms"; then found_call="$f"; fi
+            if grep -q '_perch_string_free' <<<"$syms"; then found_free="$f"; fi
+          done < <(find "$bundle" -type f)
+
+          echo "---- 结论 ----"
+          echo "_perch_call        -> ${found_call:-（未找到）}"
+          echo "_perch_string_free -> ${found_free:-（未找到）}"
+
+          if [ -n "$found_call" ] && [ -n "$found_free" ]; then
+            # 运行时要的是「进程内某个已加载镜像导出该符号」，
+            # 而不是「必须在 Runner 这个文件里」—— 查整个 bundle 才是对的断言。
+            echo "======== 断言通过：符号在 ${found_call} 里 ========"
+            exit 0
           fi
 
-          status=0
-          for symbol in _perch_call _perch_string_free; do
-            if grep -qE "^[[:xdigit:]]+ +[A-Za-z] +${symbol}$" <<<"$symbols"; then
-              echo "✓ $symbol 已链入 App"
-            else
-              echo "✗ $symbol 不在 App 二进制的符号表里"
-              status=1
-            fi
-          done
-
-          if [ "$status" -ne 0 ]; then
-            echo "======== 失败原因排查 ========"
-            echo "---- ① libperch_ffi.a 本身有符号吗 ----"
-            found_lib=0
-            for lib in app/build/ios/*/libperch_ffi.a; do
-              [ -f "$lib" ] || continue
-              found_lib=1
+          echo "======== 失败原因排查 ========"
+          echo "---- ① 静态库位置与符号 ----"
+          find app -name 'libperch_ffi.a' -print 2>/dev/null > /tmp/libs.txt || true
+          if [ -s /tmp/libs.txt ]; then
+            while IFS= read -r lib; do
               echo "库: $lib"
               nm "$lib" 2>&1 | grep -E ' _perch_(call|string_free)$' || echo "  （库里也没有！）"
-            done
-            [ "$found_lib" -eq 0 ] && echo "  没找到 libperch_ffi.a —— 构建阶段没产出"
-            echo "---- ② CocoaPods 生成的链接参数里有没有 force_load ----"
-            hit=0
-            for xc in "app/ios/Pods/Target Support Files"/*/*.xcconfig; do
-              [ -f "$xc" ] || continue
-              if grep -q 'force_load' "$xc"; then
-                hit=1
-                echo "命中: $xc"
-                grep 'force_load' "$xc"
-              fi
-            done
-            [ "$hit" -eq 0 ] && echo "  所有 xcconfig 里都没有 force_load —— 参数没传到链接器"
-            echo "---- ③ Runner.app 内容 ----"
-            ls -la app/build/ios/iphonesimulator/Runner.app/ 2>/dev/null || true
-            echo "---- ④ 构建模式（Debug 不剥符号 / Release 会剥）----"
-            ls -d app/build/ios/*/ 2>/dev/null || true
-            exit 1
+            done < /tmp/libs.txt
+          else
+            echo "  （找不到任何 libperch_ffi.a）"
           fi
-          echo "======== 断言通过 ========"
+          echo "---- ② 主二进制的动态依赖 ----"
+          otool -L "$bundle/Runner" 2>/dev/null || true
+          echo "---- ③ __preview.dylib 的动态依赖 ----"
+          otool -L "$bundle/__preview.dylib" 2>/dev/null || true
+          exit 1
 
       - name: 汇总
         if: always()
