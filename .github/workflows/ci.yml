@@ -178,9 +178,23 @@ jobs:
       # core/rust-toolchain.toml 已声明 3 个 iOS target，rustup 会自动补齐。
       - name: 安装 rustup（供 podspec 的构建阶段调用 cargo）
         run: |
+          # ⚠️ 必须装**真实工具链**。之前写的是 --default-toolchain none，
+          # 于是 ~/.cargo/bin/cargo 只是个 rustup 代理，`command -v cargo` 能过，
+          # 但真正执行时报 "no default toolchain configured"。
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none
+            | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: 确认 cargo 真的可用
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo --version
+          rustc --version
+          rustup toolchain list
+          # podspec 的构建阶段会 cargo rustc --target aarch64-apple-ios-sim，
+          # 没有对应 target 的 std 就编不过
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target list --installed
 
       - name: 安装 Flutter
         run: |
@@ -222,12 +236,46 @@ jobs:
       - name: 编译 iOS（模拟器）
         working-directory: app
         run: |
-          # 必须开 pipefail：Actions 默认 shell 是 `bash -e` 而**不含 pipefail**，
-          # 否则 `| tail` 会让本步骤的退出码变成 tail 的 0，
-          # 构建失败也会显示通过——那比没有 CI 更糟。
-          set -o pipefail
-          # 模拟器构建不涉及签名，因此 CI 里可跑
-          flutter build ios --simulator 2>&1 | tail -200
+          set -uo pipefail
+          # 全量输出先落盘。旧版 `| tail -200` 把构建日志截到只剩 29 行，
+          # 连「podspec 的脚本阶段到底跑没跑」都无从判断（踩坑记录见 docs/10 §6.2）。
+          # 模拟器构建不涉及签名，因此 CI 里可跑。
+          if ! flutter build ios --simulator > /tmp/ios_build.log 2>&1; then
+            echo "==== 构建失败：最后 200 行 ===="
+            tail -200 /tmp/ios_build.log
+            exit 1
+          fi
+          echo "==== 构建成功（$(wc -l < /tmp/ios_build.log | tr -d ' ') 行日志）===="
+          echo "---- 与 Rust 静态库相关的行 ----"
+          grep -nE 'Build Rust core|build_rust|libperch_ffi|PhaseScriptExecution' /tmp/ios_build.log \
+            || echo "（没有任何一行提到 Rust 构建阶段）"
+          echo "---- 错误与警告 ----"
+          grep -nE '(^|[^a-z])error:|warning: ' /tmp/ios_build.log || echo "（无）"
+          echo "---- 结尾 20 行 ----"
+          tail -20 /tmp/ios_build.log
+
+      # 不论构建成败都执行：把「静态库到底在哪、链接参数到底是什么」查清楚
+      - name: 诊断 Rust 静态库与链接参数
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "======== 诊断：Rust 静态库与链接参数 ========"
+          echo "---- ① 仓库里所有 libperch_ffi.a ----"
+          find . -name 'libperch_ffi.a' -not -path './core/target/*' 2>/dev/null || true
+          echo "---- ② 整个 app/build/ios 下的 .a ----"
+          find app/build/ios -name '*.a' 2>/dev/null || true
+          echo "---- ③ cargo / rustc ----"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo --version 2>&1 || true
+          rustc --version 2>&1 || true
+          echo "---- ④ App 侧 xcconfig 的 OTHER_LDFLAGS ----"
+          for xc in "app/ios/Pods/Target Support Files/Pods-Runner"/*.xcconfig; do
+            [ -f "$xc" ] || continue
+            echo "文件: $xc"
+            grep -n 'OTHER_LDFLAGS' "$xc" || echo "  （无 OTHER_LDFLAGS）"
+          done
+          echo "---- ⑤ Pods-Runner 是否引用本插件 ----"
+          grep -n 'perch_core_ffi' "app/ios/Podfile.lock" 2>/dev/null || echo "（Podfile.lock 里没有 perch_core_ffi）"
 
       # 关键断言：`-force_load` 是否真的把 Rust 符号链进了最终二进制。
       # 编译通过 ≠ 符号在里面 —— 没有 -force_load 时链接器会把没人引用的

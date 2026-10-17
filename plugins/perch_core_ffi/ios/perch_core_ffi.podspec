@@ -3,10 +3,11 @@
 #
 # 关键点（结构与 cargokit 官方配方一致，见 docs/09 §D.2）：
 #
-# 1. `-force_load` 必须加在**本插件自己的** pod_target_xcconfig 里，
-#    而不是 App 的 xcconfig。原因：perch_call 没有任何 Swift/ObjC 代码引用它，
-#    不加 -force_load 会被链接器当成死代码丢掉，于是运行时
-#    DynamicLibrary.process() 找不到符号。
+# 1. `perch_call` 没有任何 Swift/ObjC 代码引用它，不加 -force_load 会被链接器
+#    当成死代码丢掉，于是运行时 DynamicLibrary.process() 找不到符号。
+#    但 `-force_load` 只能加在 **user_target_xcconfig**（作用于 App 的链接命令行）：
+#    静态库 pod 自己没有链接步骤，写在 pod_target_xcconfig 里等于没写。
+#    ⚠️ 这一条与 cargokit 公开示例的写法不同，是 CI 实测后的修正（见 docs/10 §四）。
 #
 # 2. script_phase 必须 execution_position = :before_compile，
 #    并声明 input_files / output_files，否则 Xcode 不知道依赖关系，
@@ -40,9 +41,18 @@ Pod::Spec.new do |spec|
     :output_files => ['${BUILT_PRODUCTS_DIR}/libperch_ffi.a'],
   }
 
+  # `DEFINES_MODULE` / `EXCLUDED_ARCHS` 作用在 **pod target** 上
   spec.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+  }
+
+  # ⚠️ `-force_load` 必须放在 **user_target_xcconfig**：
+  # 静态库 pod 自己没有链接步骤，写在 pod_target_xcconfig 里的链接参数
+  # 不会出现在 App 的链接命令行上（CI 实测：Pods-Runner.debug.xcconfig 里没有它，
+  # 而 App 链接成功 —— 说明这条参数根本没生效，见 docs/10 §四）。
+  # user_target_xcconfig 才会被写进 Pods-Runner.xcconfig，进而作用于 App 的链接。
+  spec.user_target_xcconfig = {
     'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/libperch_ffi.a',
   }
 end
