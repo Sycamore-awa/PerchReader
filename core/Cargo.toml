@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index"]
+members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync"]
 
 [workspace.package]
 version = "0.1.0"

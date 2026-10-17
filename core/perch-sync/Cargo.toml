@@ -1,0 +1,12 @@
+[package]
+name = "perch-sync"
+description = "跨端同步：混合逻辑时钟（HLC）、字段级 LWW 合并、冲突统计"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+
+[lints]
+workspace = true
