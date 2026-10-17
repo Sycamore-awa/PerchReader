@@ -20,6 +20,13 @@ set -euo pipefail
 : "${CONFIGURATION:?缺少 CONFIGURATION（应由 Xcode 提供）}"
 : "${BUILT_PRODUCTS_DIR:?缺少 BUILT_PRODUCTS_DIR（应由 Xcode 提供）}"
 
+# 把 Xcode 传入的关键变量打出来：pod target 的 BUILT_PRODUCTS_DIR
+# 是 .../<config>/perch_core_ffi/，比 App 的多一层子目录，
+# 而 podspec 里 user_target_xcconfig 用的是 App 的那个，
+# 路径写错就会 "Build input file cannot be found"（详见 docs/10 §四）。
+echo "note: PLATFORM_NAME=${PLATFORM_NAME} ARCHS=${ARCHS} CONFIGURATION=${CONFIGURATION}"
+echo "note: BUILT_PRODUCTS_DIR=${BUILT_PRODUCTS_DIR}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 本文件在 plugins/perch_core_ffi/ios/，Rust 工作区在仓库根的 core/
 CORE_DIR="${SCRIPT_DIR}/../../../core"

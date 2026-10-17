@@ -13,7 +13,10 @@
 #    并声明 input_files / output_files，否则 Xcode 不知道依赖关系，
 #    可能"先链接后编译"。
 #
-# 3. 产物放在 ${BUILT_PRODUCTS_DIR}/libperch_ffi.a，与 -force_load 的路径一致。
+# 3. 产物放在 **pod target 的** ${BUILT_PRODUCTS_DIR}/libperch_ffi.a，
+#    即 .../<config>/perch_core_ffi/libperch_ffi.a；
+#    -force_load 那边要写成 ${BUILT_PRODUCTS_DIR}/perch_core_ffi/libperch_ffi.a
+#    （两个 BUILT_PRODUCTS_DIR 含义不同，见文件末尾的注释）。
 #
 Pod::Spec.new do |spec|
   spec.name             = 'perch_core_ffi'
@@ -47,12 +50,17 @@ Pod::Spec.new do |spec|
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
   }
 
-  # ⚠️ `-force_load` 必须放在 **user_target_xcconfig**：
-  # 静态库 pod 自己没有链接步骤，写在 pod_target_xcconfig 里的链接参数
-  # 不会出现在 App 的链接命令行上（CI 实测：Pods-Runner.debug.xcconfig 里没有它，
-  # 而 App 链接成功 —— 说明这条参数根本没生效，见 docs/10 §四）。
-  # user_target_xcconfig 才会被写进 Pods-Runner.xcconfig，进而作用于 App 的链接。
+  # ⚠️ `-force_load` 必须放在 **user_target_xcconfig**（才会写进
+  # Pods-Runner.xcconfig，作用于 App 的链接命令行）。写在 pod_target_xcconfig 里
+  # 时它只影响 pod target，CI 实测 App 的 xcconfig 里根本没有这条参数。
+  #
+  # ⚠️ 路径必须带 `perch_core_ffi/` 这一层：
+  # 脚本阶段在 **pod target** 里跑，它的 BUILT_PRODUCTS_DIR 是
+  #   .../Debug-iphonesimulator/perch_core_ffi/
+  # 而这里的 ${BUILT_PRODUCTS_DIR} 是 **App target** 的
+  #   .../Debug-iphonesimulator/
+  # 少写一层就会得到 "Build input file cannot be found"（CI 实测，见 docs/10 §四）。
   spec.user_target_xcconfig = {
-    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/libperch_ffi.a',
+    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/perch_core_ffi/libperch_ffi.a',
   }
 end
