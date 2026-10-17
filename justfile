@@ -50,11 +50,31 @@ ios-symbols: build-ios-lib
     #!/usr/bin/env bash
     set -euo pipefail
     lib=core/target/aarch64-apple-ios/release/libperch_ffi.a
-    nm_bin=$(command -v llvm-nm || command -v nm)
+
+    # 必须用 **llvm-nm**：GNU nm 不认识 Mach-O 归档（报 "file format not recognized"）。
+    # 名字可能是 llvm-nm、llvm-nm-18，或只存在于 /usr/lib/llvm-*/bin 下，逐一找。
+    nm_bin=""
+    for candidate in llvm-nm $(ls -1 /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | sort -V | tail -1); do
+      if command -v "$candidate" >/dev/null 2>&1; then nm_bin=$candidate; break; fi
+      if [ -x "$candidate" ]; then nm_bin=$candidate; break; fi
+    done
+
+    if [ -z "$nm_bin" ]; then
+      # 本地开发机可能没装 LLVM。**显式跳过并把原因喊出来**，而不是静默通过：
+      # 想强制要求（例如 CI）就设 PERCH_REQUIRE_LLVM_NM=1。
+      if [ "${PERCH_REQUIRE_LLVM_NM:-0}" = "1" ]; then
+        echo "!! 找不到 llvm-nm，无法校验 iOS 符号导出（PERCH_REQUIRE_LLVM_NM=1）" >&2
+        exit 1
+      fi
+      echo "::warning::未找到 llvm-nm，跳过 iOS 符号导出检查（GNU nm 不支持 Mach-O）"
+      exit 0
+    fi
+    echo "使用 $nm_bin"
+
     # 先整体取出符号表再比较：**不能**写成 `nm ... | grep -q`。
     # grep -q 命中后立即退出会关掉管道，nm 收到 SIGPIPE 而非零退出，
     # 在 set -o pipefail 下整个管道被判失败 —— 表现为"匹配成功却报失败"。
-    symbols=$("$nm_bin" --defined-only -g "$lib" 2>/dev/null)  # 2>/dev/null: 屏蔽空目标文件的 "no symbols" 噪声
+    symbols=$("$nm_bin" --defined-only -g "$lib" 2>/dev/null)
     for symbol in _perch_call _perch_string_free; do
       if ! grep -q "T $symbol$" <<<"$symbols"; then
         echo "!! iOS 静态库缺少全局导出符号 $symbol" >&2

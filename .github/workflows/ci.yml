@@ -75,8 +75,22 @@ jobs:
           cargo --version
           rustup target list --installed
 
-      # 与本地 `just ci` 完全相同
+      # iOS 符号导出检查需要 llvm-nm（GNU nm 不认识 Mach-O 归档）。
+      # ubuntu 镜像通常已带 LLVM，但位置可能是 /usr/lib/llvm-*/bin，故先探测再装。
+      - name: 确保 llvm-nm 可用
+        run: |
+          if ! command -v llvm-nm >/dev/null 2>&1 && ! ls /usr/lib/llvm-*/bin/llvm-nm >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y llvm
+          fi
+          command -v llvm-nm || ls -1 /usr/lib/llvm-*/bin/llvm-nm | tail -1
+
+      # 与本地 `just ci` 完全相同（含 iOS 静态库的符号导出断言）。
+      # PERCH_REQUIRE_LLVM_NM=1：CI 上缺 llvm-nm 必须红，不允许静默跳过——
+      # 否则"本地绿 CI 红"会变成"两边都绿但检查其实没跑"。
       - name: just ci
+        env:
+          PERCH_REQUIRE_LLVM_NM: '1'
         run: just ci
 
   # ------------------------------------------------------------------
