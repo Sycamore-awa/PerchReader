@@ -13,7 +13,7 @@
 
 import 'dart:io';
 
-import 'package:perch/perch_core.dart';
+import 'package:perch_core/perch_core.dart';
 
 int _passed = 0;
 int _failed = 0;

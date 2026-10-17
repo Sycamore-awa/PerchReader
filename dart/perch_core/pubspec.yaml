@@ -1,0 +1,10 @@
+name: perch_core
+description: PerchReader 核心（Rust）的 Dart 绑定：C ABI + JSON 契约
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: '>=3.8.0 <4.0.0'
+
+dependencies:
+  ffi: ^2.1.0

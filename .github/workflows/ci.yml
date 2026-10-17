@@ -80,6 +80,43 @@ jobs:
         run: just ci
 
   # ------------------------------------------------------------------
+  # FFI 端到端：用 Dart 真的加载 .so 调用 Rust（约 2~3 分钟）
+  #
+  # 这是唯一能自动验证"Rust ↔ Dart 契约"的手段，且不需要任何设备或 Mac。
+  # 与 core-linux 并行跑（都是免费的 Linux 分钟）。
+  # ------------------------------------------------------------------
+  ffi-smoke:
+    name: FFI 端到端（Dart ↔ Rust C ABI）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # 用 Dart 官方 tarball，不引入第三方 action
+      - name: 安装 Dart SDK
+        run: |
+          curl -sSL -o /tmp/dart.zip \
+            https://storage.googleapis.com/dart-archive/channels/stable/release/latest/sdk/dartsdk-linux-x64-release.zip
+          unzip -q /tmp/dart.zip -d "$HOME"
+          echo "$HOME/dart-sdk/bin" >> "$GITHUB_PATH"
+          "$HOME/dart-sdk/bin/dart" --version
+
+      - name: 编译核心动态库
+        working-directory: core
+        run: cargo build -p perch-ffi --release
+
+      - name: 运行端到端冒烟
+        working-directory: dart/perch_core
+        run: |
+          dart pub get
+          dart run tool/ffi_smoke.dart ../../core/target/release/libperch_ffi.so
+
+  # ------------------------------------------------------------------
   # 慢回路：云端 macOS 编译 iOS（约 10~20 分钟）
   # ------------------------------------------------------------------
   ios-macos:

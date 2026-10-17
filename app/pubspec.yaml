@@ -37,6 +37,10 @@ dependencies:
   flutter_readium: ^0.6.2
   ffi: ^2.2.0
 
+  # 核心绑定层（纯 Dart 包，不依赖 Flutter，便于独立测试）
+  perch_core:
+    path: ../dart/perch_core
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

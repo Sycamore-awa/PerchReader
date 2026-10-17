@@ -68,7 +68,8 @@ core-lib:
 
 # FFI 端到端冒烟：真的用 Dart 加载 .so 并调用所有 crate（无需设备、无需 Mac）
 ffi-smoke: core-lib
-    cd app && dart run tool/ffi_smoke.dart ../core/target/release/libperch_ffi.so
+    cd dart/perch_core && dart pub get
+    cd dart/perch_core && dart run tool/ffi_smoke.dart ../../core/target/release/libperch_ffi.so
 
 # Dart 静态分析
 # 注意：这里用 dart analyze 而不是 flutter analyze —— 后者在含中文的项目路径下会
