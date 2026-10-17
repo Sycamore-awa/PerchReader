@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync"]
+members = ["perch-model", "perch-epub", "perch-txt", "perch-pagecurl", "perch-index", "perch-sync", "perch-import"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +21,8 @@ quick-xml = "0.42"
 # TXT：编码探测与解码（都是纯 Rust，满足"零 C 依赖"约束）
 chardetng = "1"
 encoding_rs = "0.8"
+# 文件指纹（纯 Rust，可为 iOS 交叉编译）
+sha2 = "0.10"
 
 # 核心库的硬性约束：
 # - 禁止 unsafe（核心是纯逻辑，且要能在 Linux 上为 iOS 交叉校验）

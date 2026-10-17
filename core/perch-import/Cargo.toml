@@ -1,0 +1,13 @@
+[package]
+name = "perch-import"
+description = "导入管线阶段①（登记）：文件指纹、去重、登记计划"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
