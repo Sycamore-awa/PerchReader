@@ -241,23 +241,25 @@ jobs:
             echo "::error::找不到 Runner 可执行文件"
             exit 1
           fi
-          echo "检查：$binary"
-          ls -la "$binary"
+
+          # 诊断信息通过 ::error:: 注解输出，便于在不下载日志的情况下定位问题
+          # （Actions 日志接口需要认证，而 annotations 接口是公开的）
+          symbols=$(nm "$binary" 2>/dev/null || true)
+          total=$(wc -l <<<"$symbols" | tr -d ' ')
+          anchor=$(grep -c '_perch_link_anchor' <<<"$symbols" || true)
+          perch=$(grep -i 'perch' <<<"$symbols" | head -6 | tr '\n' '|')
+
+          diag="binary=$binary 总符号=$total 锚点命中=$anchor perch行=[$perch]"
 
           # 先取整张符号表再比较（不要 nm | grep -q：见 docs/03 §九）
-          symbols=$(nm "$binary" 2>/dev/null || true)
-          echo "--- 符号表里所有 perch 相关条目（自诊断用）---"
-          grep -i perch <<<"$symbols" || echo "（一条都没有）"
-          echo "--- 符号总数 ---"
-          wc -l <<<"$symbols"
-
           for symbol in _perch_call _perch_string_free; do
             if ! grep -qE "^[0-9a-f]+ [Tt] $symbol$" <<<"$symbols"; then
-              echo "::error::$symbol 不在 App 二进制里 —— 静态库没有被链入"
+              echo "::error::$symbol 不在 App 二进制里 —— $diag"
               exit 1
             fi
             echo "✓ $symbol 已链入 App"
           done
+          echo "✓ 全部符号已链入（$diag）"
 
       - name: 汇总
         if: always()
