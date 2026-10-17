@@ -458,6 +458,7 @@ dependencies = [
  "perch-epub",
  "perch-import",
  "perch-index",
+ "perch-jobs",
  "perch-model",
  "perch-pagecurl",
  "perch-pdf",
@@ -465,6 +466,7 @@ dependencies = [
  "perch-txt",
  "serde",
  "serde_json",
+ "zip",
 ]
 
 [[package]]
@@ -480,6 +482,18 @@ name = "perch-index"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "perch-jobs"
+version = "0.1.0"
+dependencies = [
+ "perch-epub",
+ "perch-index",
+ "perch-model",
+ "serde",
+ "thiserror",
+ "zip",
 ]
 
 [[package]]

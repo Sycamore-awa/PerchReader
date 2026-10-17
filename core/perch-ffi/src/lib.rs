@@ -115,6 +115,19 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             Ok(json!({ "fingerprint": fingerprint.to_hex() }))
         }
 
+        // ---- 阶段②精修（perch-jobs）----
+        "jobs.refine" => {
+            let bytes = hex_to_bytes(required_str(&args, "bytes_hex")?)?;
+            let max_chars = args
+                .get("max_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(perch_jobs::ExtractOptions::default().max_chars);
+            let refinement =
+                perch_jobs::refine_epub(&bytes, perch_jobs::ExtractOptions { max_chars })
+                    .map_err(|error| FfiError::new(error.code(), error.to_string()))?;
+            serde_json::to_value(&refinement).map_err(|error| FfiError::bad_args(error.to_string()))
+        }
+
         // ---- PDF（perch-pdf）----
         "pdf.analyze" => {
             let bytes = hex_to_bytes(required_str(&args, "bytes_hex")?)?;
@@ -621,6 +634,89 @@ mod tests {
         .to_string();
         let second = dispatch("sync.delta", &args);
         assert_eq!(second["changes"].as_array().unwrap().len(), 0);
+    }
+
+    // ---------- 阶段②精修 ----------
+
+    /// 造一个最小 EPUB（1 章 + 元数据 + EPUB3 目录 + 封面声明）。
+    fn epub_fixture() -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buffer);
+            let stored =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let deflated = SimpleFileOptions::default();
+
+            zip.start_file("mimetype", stored).unwrap();
+            zip.write_all(b"application/epub+zip").unwrap();
+
+            zip.start_file("META-INF/container.xml", deflated).unwrap();
+            zip.write_all(r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#.as_bytes()).unwrap();
+
+            zip.start_file("OEBPS/content.opf", deflated).unwrap();
+            zip.write_all(
+                r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:uuid:ffi-test</dc:identifier>
+    <dc:title>精修测试书</dc:title>
+    <dc:creator>某作者</dc:creator>
+    <dc:language>zh-CN</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="chap0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+  </manifest>
+  <spine><itemref idref="c0"/></spine>
+</package>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            zip.start_file("OEBPS/chap0.xhtml", deflated).unwrap();
+            zip.write_all(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章</h1><p>春天的花开</p></body></html>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            zip.start_file("OEBPS/nav.xhtml", deflated).unwrap();
+            zip.write_all(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><nav epub:type="toc"><ol><li><a href="chap0.xhtml">第一章</a></li></ol></nav></body></html>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            zip.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn jobs_refine_reads_metadata_and_toc() {
+        let args = json!({ "bytes_hex": hex(&epub_fixture()) }).to_string();
+        let out = dispatch("jobs.refine", &args);
+        assert_eq!(out["title"], "精修测试书");
+        assert_eq!(out["author"], "某作者");
+        assert_eq!(out["language"], "zh-CN");
+        assert_eq!(out["spineCount"], 1);
+        assert_eq!(out["toc"][0], "第一章");
+        assert!(out["charCount"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn jobs_refine_rejects_non_epub() {
+        let args = json!({ "bytes_hex": hex(b"not a zip at all") }).to_string();
+        let out = dispatch("jobs.refine", &args);
+        assert_eq!(out["error"]["code"], "JOBS_EPUB");
     }
 
     // ---------- PDF 结构 ----------

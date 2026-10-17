@@ -259,6 +259,15 @@ void main(List<String> args) {
     check('非 PDF 的错误码', error.code, 'PDF_NOT_PDF');
   }
 
+  // ---- 11) 阶段②精修（按错误路径验证边界；成功路径由 Rust FFI 测试覆盖）----
+  stdout.writeln('[11] 阶段②精修');
+  try {
+    core.refineEpub('这不是 epub'.codeUnits);
+    checkTrue('非 EPUB 应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('非 EPUB 的错误码', error.code, 'JOBS_EPUB');
+  }
+
   // ---- 汇总 ----
   stdout.writeln('');
   stdout.writeln('通过 $_passed 项，失败 $_failed 项');

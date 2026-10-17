@@ -1,0 +1,20 @@
+[package]
+name = "perch-jobs"
+description = "导入阶段②③的实际执行：精修（元数据/目录/字数）与建索引（正文抽取 + 章节映射）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+perch-model.workspace = true
+perch-epub.workspace = true
+perch-index.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# 仅测试用：在内存里造 EPUB 夹具
+zip.workspace = true
+
+[lints]
+workspace = true

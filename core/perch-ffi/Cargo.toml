@@ -18,6 +18,7 @@ perch-pagecurl.workspace = true
 perch-sync.workspace = true
 perch-import.workspace = true
 perch-pdf.workspace = true
+perch-jobs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
@@ -26,5 +27,6 @@ serde_json.workspace = true
 # 工作区其它 crate 依然被 forbid(unsafe_code) 保护。
 
 [dev-dependencies]
-# 仅测试用：构造 PDF 夹具（不影响 iOS 构建）
+# 仅测试用：构造 PDF / EPUB 夹具（不影响 iOS 构建）
 lopdf = { version = "0.45", default-features = false }
+zip.workspace = true

@@ -19,7 +19,10 @@
 //! # 尚未实现（下一步）
 //!
 //! - CFI 范围定位的"相对路径 → 绝对路径"展开（点定位已可用，见 [`cfi`]）
-//! - 全文抽取（供索引使用）
+//! - ~~全文抽取（供索引使用）~~ → **已由 `perch-jobs` 实现**：
+//!   [`perch_jobs::extract_epub_text`] 把书脊读成纯文本 + 章节区间映射，
+//!   [`perch_jobs::index_book`] 直接喂给 `perch-index`。
+//!   本 crate 仍然只做"结构 ↔ 定位"，不承担"拼出整本书"的职责。
 
 #![forbid(unsafe_code)]
 

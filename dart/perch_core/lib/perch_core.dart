@@ -170,6 +170,16 @@ class PerchCore {
     return (result['hits'] as List).cast<Map<String, dynamic>>();
   }
 
+  /// 阶段②精修：解析 EPUB 的元数据 / 封面 / 目录 / 字数。
+  ///
+  /// 返回 `{title?, author?, language?, coverHref?, toc, spineCount, charCount}`。
+  /// `maxChars` 限制抽取正文的字符数（超限会被截断，不会 OOM）。
+  Map<String, dynamic> refineEpub(List<int> bytes, {int? maxChars}) =>
+      invoke('jobs.refine', {
+        'bytes_hex': _hex(bytes),
+        if (maxChars != null) 'max_chars': maxChars,
+      });
+
   /// 解析 PDF 结构（页数 / 大纲 / 元数据）。
   ///
   /// 只返回结构信息，**不抽正文、不渲染**：正文走平台注入的 port。
