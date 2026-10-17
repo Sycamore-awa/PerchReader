@@ -185,6 +185,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "perch-index"
+version = "0.1.0"
+
+[[package]]
 name = "perch-model"
 version = "0.1.0"
 dependencies = [

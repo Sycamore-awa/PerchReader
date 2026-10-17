@@ -1,0 +1,9 @@
+[package]
+name = "perch-index"
+description = "全文索引：CJK bigram 分词 + 倒排（token -> 分片）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
