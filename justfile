@@ -52,33 +52,37 @@ ios-symbols: build-ios-lib
     lib=core/target/aarch64-apple-ios/release/libperch_ffi.a
 
     # 必须用 **llvm-nm**：GNU nm 不认识 Mach-O 归档（报 "file format not recognized"）。
-    # 名字可能是 llvm-nm、llvm-nm-18，或只存在于 /usr/lib/llvm-*/bin 下，逐一找。
-    nm_bin=""
-    for candidate in llvm-nm $(ls -1 /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | sort -V | tail -1); do
-      if command -v "$candidate" >/dev/null 2>&1; then nm_bin=$candidate; break; fi
-      if [ -x "$candidate" ]; then nm_bin=$candidate; break; fi
-    done
+    nm_bin=${PERCH_NM_BIN:-}
+    if [ -z "$nm_bin" ]; then
+      nm_bin=$(command -v llvm-nm 2>/dev/null || true)
+    fi
+    if [ -z "$nm_bin" ]; then
+      nm_bin=$(ls -1 /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | tail -1 || true)
+    fi
 
     if [ -z "$nm_bin" ]; then
-      # 本地开发机可能没装 LLVM。**显式跳过并把原因喊出来**，而不是静默通过：
-      # 想强制要求（例如 CI）就设 PERCH_REQUIRE_LLVM_NM=1。
+      # 本地可能没装 LLVM。**显式跳过并喊出来**，不静默通过。
       if [ "${PERCH_REQUIRE_LLVM_NM:-0}" = "1" ]; then
-        echo "!! 找不到 llvm-nm，无法校验 iOS 符号导出（PERCH_REQUIRE_LLVM_NM=1）" >&2
+        echo "::error::找不到 llvm-nm，无法校验 iOS 符号导出（PERCH_REQUIRE_LLVM_NM=1）" >&2
         exit 1
       fi
       echo "::warning::未找到 llvm-nm，跳过 iOS 符号导出检查（GNU nm 不支持 Mach-O）"
       exit 0
     fi
-    echo "使用 $nm_bin"
+    echo "使用 nm: $nm_bin"
 
     # 先整体取出符号表再比较：**不能**写成 `nm ... | grep -q`。
     # grep -q 命中后立即退出会关掉管道，nm 收到 SIGPIPE 而非零退出，
     # 在 set -o pipefail 下整个管道被判失败 —— 表现为"匹配成功却报失败"。
-    symbols=$("$nm_bin" --defined-only -g "$lib" 2>/dev/null)
+    symbols=$("$nm_bin" --defined-only -g "$lib" 2>/dev/null || true)
+    if [ -z "$symbols" ]; then
+      echo "::error::$nm_bin 无法读取 $lib 的符号表" >&2
+      exit 1
+    fi
     for symbol in _perch_call _perch_string_free; do
       if ! grep -q "T $symbol$" <<<"$symbols"; then
-        echo "!! iOS 静态库缺少全局导出符号 $symbol" >&2
-        echo "   （若成为 t/U，链接进 App 后 DynamicLibrary.process() 会解析失败）" >&2
+        echo "::error::iOS 静态库缺少全局导出符号 $symbol" >&2
+        grep -c ' T ' <<<"$symbols" >&2 || true
         exit 1
       fi
       echo "✓ $symbol 是全局导出符号"

@@ -76,22 +76,41 @@ jobs:
           rustup target list --installed
 
       # iOS 符号导出检查需要 llvm-nm（GNU nm 不认识 Mach-O 归档）。
-      # ubuntu 镜像通常已带 LLVM，但位置可能是 /usr/lib/llvm-*/bin，故先探测再装。
+      # 建一个稳定路径的符号链接，避免下游依赖 /usr/lib/llvm-*/bin 这种易变位置。
       - name: 确保 llvm-nm 可用
         run: |
-          if ! command -v llvm-nm >/dev/null 2>&1 && ! ls /usr/lib/llvm-*/bin/llvm-nm >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y llvm
+          if ! command -v llvm-nm >/dev/null 2>&1; then
+            found=$(ls -1 /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | tail -1 || true)
+            if [ -z "$found" ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y llvm
+              found=$(ls -1 /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | tail -1 || true)
+            fi
+            if [ -z "$found" ]; then
+              echo "::error::安装后仍找不到 llvm-nm"
+              exit 1
+            fi
+            sudo ln -sf "$found" /usr/local/bin/llvm-nm
           fi
-          command -v llvm-nm || ls -1 /usr/lib/llvm-*/bin/llvm-nm | tail -1
+          llvm-nm --version | head -1
 
-      # 与本地 `just ci` 完全相同（含 iOS 静态库的符号导出断言）。
-      # PERCH_REQUIRE_LLVM_NM=1：CI 上缺 llvm-nm 必须红，不允许静默跳过——
-      # 否则"本地绿 CI 红"会变成"两边都绿但检查其实没跑"。
-      - name: just ci
+      # 拆成独立步骤（而不是单个 `just ci`）：
+      # 这样某一步失败时，**失败的步骤名本身就说明了是哪一环**，
+      # 不需要登录看日志也能定位。命令与本地 justfile 完全一致。
+      - name: 格式检查
+        run: just fmt-check
+      - name: clippy
+        run: just lint
+      - name: Rust 测试
+        run: just test
+      - name: iOS 交叉编译检查
+        run: just check-ios
+      - name: iOS 模拟器交叉编译检查
+        run: just check-ios-sim
+      - name: iOS 符号导出断言
         env:
           PERCH_REQUIRE_LLVM_NM: '1'
-        run: just ci
+        run: just ios-symbols
 
   # ------------------------------------------------------------------
   # FFI 端到端：用 Dart 真的加载 .so 调用 Rust（约 2~3 分钟）
