@@ -24,7 +24,7 @@
 //! ②和③都是幂等的，重做安全。
 
 use perch_model::{BookId, Format, ImportState};
-use perch_pipeline::{Gate, Policy, Priority, Scheduler, Stage};
+use perch_pipeline::{EnqueueOutcome, Gate, Policy, Priority, Scheduler, Stage};
 
 use crate::{BookText, ExtractOptions, JobsError, Refinement, extract_text, index_book, refine};
 
@@ -132,9 +132,31 @@ impl<S: BookStore> Pipeline<S> {
         self.scheduler.enqueue(book, state, priority);
     }
 
+    /// 手动重试一本重试耗尽的（`Exhausted`）书。
+    ///
+    /// 返回 `false` 表示这本书不在耗尽列表里（没什么可重试的）。
+    pub fn revive(&mut self, book: BookId, priority: Priority) -> bool {
+        self.scheduler.revive(book, priority)
+    }
+
     /// 用户打开某本书：插队。
     pub fn promote(&mut self, book: BookId, priority: Priority) {
         self.scheduler.promote(book, priority);
+    }
+
+    /// 崩溃恢复：按**持久化下来的**状态与失败次数重新入队。
+    ///
+    /// 与 [`Self::enqueue`] 的唯一区别是 `attempts` 从磁盘来。这一条不能省：
+    /// [`Scheduler::resume`] 的注释写得很清楚——次数不持久化，重启就把失败历史清零，
+    /// 结果是**无限重试**同一本坏书。
+    pub fn resume(
+        &mut self,
+        book: BookId,
+        state: ImportState,
+        priority: Priority,
+        attempts: u16,
+    ) -> EnqueueOutcome {
+        self.scheduler.resume(book, state, priority, attempts)
     }
 
     /// 删书：取消所有相关任务。
@@ -146,6 +168,11 @@ impl<S: BookStore> Pipeline<S> {
     #[must_use]
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
+    }
+
+    /// 存储的可变引用：调用方要登记书的来源（路径 / 格式）与记录失败次数。
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
     }
 
     /// 借用存储。

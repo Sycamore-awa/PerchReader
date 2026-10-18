@@ -76,14 +76,17 @@ struct OpenBook {
 
 /// 句柄表里的一类东西。
 ///
-/// **两类分开**：`book.*` 走索引/搜索（阶段③的产物），`txt.*` 走阅读路径。
-/// 各有独立配额，也各有独立的错误码——"书太多"和"阅读句柄被后台任务占满"
-/// 是两种完全不同的故障，混成一个码会让排查和降级都变难（`docs/11` §5.2 ①）。
+/// **三类分开**：`book.*` 走索引/搜索（阶段③的产物），`txt.*` 走阅读路径，
+/// `pipeline.*` 是导入管线的驱动句柄。各有独立配额，也各有独立的错误码——
+/// "书太多"、"阅读句柄被后台任务占满"、"管线只能有一个"是三种完全不同的故障，
+/// 混成一个码会让排查和降级都变难（`docs/11` §5.2 ①、`docs/13` §三）。
 enum OpenDoc {
     /// 已建索引的书：`book.open` 产出。
     Book(OpenBook),
     /// 已解码的 TXT：`txt.open` 产出，**不建倒排索引**。
     Txt(perch_txt::TxtDocument),
+    /// 导入管线：`pipeline.open` 产出（调度 + 按路径读写的存储）。
+    Pipeline(perch_jobs::Pipeline<perch_jobs::PathStore>),
 }
 
 impl OpenDoc {
@@ -92,6 +95,7 @@ impl OpenDoc {
         match self {
             Self::Book(_) => "book",
             Self::Txt(_) => "txt",
+            Self::Pipeline(_) => "pipeline",
         }
     }
 }
@@ -109,6 +113,8 @@ struct Registry {
     books: usize,
     /// 当前打开的 TXT 句柄数。
     txts: usize,
+    /// 当前打开的管线句柄数。
+    pipelines: usize,
 }
 
 static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
@@ -160,12 +166,30 @@ impl Registry {
         Ok(handle)
     }
 
+    /// 登记一个管线句柄。**只允许 1 个**：管线自己就是"全局后台任务"，
+    /// 开两个只会让同一本书被两条队列同时处理。
+    fn insert_pipeline(
+        &mut self,
+        pipeline: perch_jobs::Pipeline<perch_jobs::PathStore>,
+    ) -> Result<u64, FfiError> {
+        if self.pipelines >= 1 {
+            return Err(FfiError::new(
+                "PIPELINE_TOO_MANY_OPEN",
+                "同时只允许开一条导入管线，请先 pipeline.close",
+            ));
+        }
+        let handle = self.push(OpenDoc::Pipeline(pipeline));
+        self.pipelines += 1;
+        Ok(handle)
+    }
+
     /// 摘掉一个句柄，并维护计数。
     fn remove(&mut self, handle: u64) -> Option<OpenDoc> {
         let doc = self.open.remove(&handle)?;
         match doc {
             OpenDoc::Book(_) => self.books = self.books.saturating_sub(1),
             OpenDoc::Txt(_) => self.txts = self.txts.saturating_sub(1),
+            OpenDoc::Pipeline(_) => self.pipelines = self.pipelines.saturating_sub(1),
         }
         Some(doc)
     }
@@ -203,6 +227,28 @@ impl Registry {
             )),
             None => Err(FfiError::new(
                 "TXT_BAD_HANDLE",
+                format!("句柄 {handle} 不存在（可能已 close 或从未 open）"),
+            )),
+        }
+    }
+
+    /// 借一个管线句柄（可变：`step` / `enqueue` 都要改它）。
+    fn pipeline_mut(
+        &mut self,
+        handle: u64,
+    ) -> Result<&mut perch_jobs::Pipeline<perch_jobs::PathStore>, FfiError> {
+        match self.open.get_mut(&handle) {
+            Some(OpenDoc::Pipeline(pipeline)) => Ok(pipeline),
+            Some(other) => Err(FfiError::new(
+                "HANDLE_WRONG_KIND",
+                format!(
+                    "句柄 {handle} 是 {} 类型，pipeline.* 用不了；该用 {}.close 释放",
+                    other.kind(),
+                    other.kind()
+                ),
+            )),
+            None => Err(FfiError::new(
+                "PIPELINE_BAD_HANDLE",
                 format!("句柄 {handle} 不存在（可能已 close 或从未 open）"),
             )),
         }
@@ -506,6 +552,173 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             }))
         }
 
+        // ---- 导入管线（perch-jobs::Pipeline + PathStore，见 docs/13）----
+        //
+        // 设计要点：**平台只给路径与产物目录**，读文件、写产物、调度都在 Rust 里。
+        // 不做跨语言回调——那样只能在设备上验，而这条链路在 Linux 上用临时目录
+        // 就能完整跑通（`perch-jobs` 的 store 单测就是这么做的）。
+        "pipeline.open" => {
+            let out_dir = required_str(&args, "out_dir")?;
+            let store = perch_jobs::PathStore::new(out_dir)
+                .map_err(|error| FfiError::new("PIPELINE_IO", error))?;
+            let recovered: Vec<Value> = store
+                .recovered()
+                .iter()
+                .map(|item| {
+                    json!({
+                        "book": item.book,
+                        "state": item.state,
+                        "attempts": item.attempts,
+                    })
+                })
+                .collect();
+            let policy = policy_arg(&args)?;
+            let max_chars = args
+                .get("max_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(perch_jobs::ExtractOptions::default().max_chars);
+            let chunk_chars = args
+                .get("chunk_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(perch_index::DEFAULT_CHUNK_CHARS);
+            let pipeline = perch_jobs::Pipeline::new(
+                store,
+                policy,
+                perch_jobs::ExtractOptions { max_chars },
+                chunk_chars,
+            )
+            .map_err(|error| FfiError::new("PIPELINE_POLICY", error.to_string()))?;
+            let handle = registry().insert_pipeline(pipeline)?;
+            Ok(json!({ "handle": handle, "recovered": recovered }))
+        }
+
+        // 登记一本书（阶段①完成后调用）。format **必须显式给**：
+        // 嗅探会把一个损坏的 EPUB 当纯文本收下，静默产出一本乱码书。
+        // 已被恢复出来的状态优先——崩溃前停在哪就接着做哪。
+        "pipeline.enqueue" => {
+            let handle = required_u64(&args, "handle")?;
+            let book = book_arg(&args)?;
+            let path = required_str(&args, "path")?;
+            let format = format_arg(&args)?.ok_or_else(|| {
+                FfiError::bad_args("必须显式给 format（嗅探会把损坏的 EPUB 当纯文本）")
+            })?;
+            let priority = priority_arg(&args)?;
+
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            pipeline.store_mut().register(book, path, format);
+            let recorded = pipeline.store().state(book);
+            let state = match recorded {
+                Some(item) => item.state,
+                None => state_arg(&args)?,
+            };
+            let attempts = recorded.map_or(0, |item| item.attempts);
+            let outcome = pipeline.resume(book, state, priority, attempts);
+            Ok(json!({
+                "outcome": enqueue_outcome_str(outcome),
+                "stage": enqueue_outcome_stage(outcome),
+                "state": state,
+                "attempts": attempts,
+            }))
+        }
+
+        // 做**一个**任务。一次一个，平台可以随时停手（进后台、让位给阅读）。
+        "pipeline.step" => {
+            let handle = required_u64(&args, "handle")?;
+            let now = args
+                .get("now_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(now_ms_now);
+            let gate = gate_arg(&args)?;
+
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            let outcome = pipeline.step(now, gate);
+            // 失败次数要落盘：不落盘的话重启会把历史清零 → 无限重试同一本坏书
+            if let perch_jobs::StepOutcome::Failed { book, attempts, .. } = &outcome {
+                let book = *book;
+                let attempts = *attempts;
+                pipeline.store_mut().record_attempts(book, attempts).ok();
+            }
+            let stats = pipeline.scheduler().stats();
+            Ok(step_outcome_json(&outcome, stats))
+        }
+
+        // 队列概览（书架上的"正在精修 N 本"读这个）。
+        "pipeline.status" => {
+            let handle = required_u64(&args, "handle")?;
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            let stats = pipeline.scheduler().stats();
+            Ok(json!({
+                "idle": pipeline.is_idle(),
+                "stats": stats_json(stats),
+            }))
+        }
+
+        // 单本书的落盘状态（书架卡片按需查）。
+        "pipeline.state" => {
+            let handle = required_u64(&args, "handle")?;
+            let book = book_arg(&args)?;
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            match pipeline.store().state(book) {
+                Some(item) => Ok(json!({
+                    "known": true,
+                    "state": item.state,
+                    "attempts": item.attempts,
+                })),
+                None => Ok(json!({ "known": false })),
+            }
+        }
+
+        // 用户点开某本书：插队。
+        "pipeline.promote" => {
+            let handle = required_u64(&args, "handle")?;
+            let book = book_arg(&args)?;
+            let priority = priority_arg(&args)?;
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            pipeline.promote(book, priority);
+            Ok(json!({ "promoted": true, "priority": priority_str(priority) }))
+        }
+
+        // 手动重试一本耗尽的（卡在 failed 的书不能自己回来，得有人推一把）。
+        "pipeline.retry" => {
+            let handle = required_u64(&args, "handle")?;
+            let book = book_arg(&args)?;
+            let priority = priority_arg(&args)?;
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            let revived = pipeline.revive(book, priority);
+            Ok(json!({ "retried": revived }))
+        }
+
+        // 删书：取消它所有相关任务。
+        "pipeline.cancel" => {
+            let handle = required_u64(&args, "handle")?;
+            let book = book_arg(&args)?;
+            let mut guard = registry();
+            let pipeline = guard.pipeline_mut(handle)?;
+            pipeline.cancel(book);
+            Ok(json!({ "cancelled": true }))
+        }
+
+        "pipeline.close" => {
+            let handle = required_u64(&args, "handle")?;
+            let mut guard = registry();
+            if let Some(kind) = guard.kind_of(handle) {
+                if kind != "pipeline" {
+                    return Err(FfiError::new(
+                        "HANDLE_WRONG_KIND",
+                        format!("句柄 {handle} 是 {kind} 类型，请用 {kind}.close"),
+                    ));
+                }
+            }
+            let removed = guard.remove(handle).is_some();
+            Ok(json!({ "closed": removed }))
+        }
+
         "txt.close" => {
             let handle = required_u64(&args, "handle")?;
             let mut guard = registry();
@@ -689,6 +902,177 @@ fn format_arg(args: &Value) -> Result<Option<Format>, FfiError> {
         "txt" => Ok(Some(Format::Txt)),
         other => Err(FfiError::bad_args(format!("未知格式: {other}"))),
     }
+}
+
+/// 从入参取 `book`（UUID 字符串）。
+///
+/// 借 `serde` 反序列化而不是手写 UUID 解析：`BookId` 是 `#[serde(transparent)]`，
+/// 这样"契约形状"只有一处定义。
+fn book_arg(args: &Value) -> Result<perch_model::BookId, FfiError> {
+    let value = args
+        .get("book")
+        .cloned()
+        .ok_or_else(|| FfiError::bad_args("缺少 book"))?;
+    serde_json::from_value(value).map_err(|error| FfiError::bad_args(format!("book: {error}")))
+}
+
+/// 从入参取调度策略（缺省用默认值；`docs/13` §三）。
+fn policy_arg(args: &Value) -> Result<perch_pipeline::Policy, FfiError> {
+    let mut policy = perch_pipeline::Policy::default();
+    let Some(object) = args.get("policy") else {
+        return Ok(policy);
+    };
+    if let Some(value) = object.get("maxRefine").and_then(Value::as_u64) {
+        policy.max_refine = value as usize;
+    }
+    if let Some(value) = object.get("maxIndex").and_then(Value::as_u64) {
+        policy.max_index = value as usize;
+    }
+    if let Some(value) = object.get("maxAttempts").and_then(Value::as_u64) {
+        policy.max_attempts =
+            u16::try_from(value).map_err(|_| FfiError::bad_args("maxAttempts 太大"))?;
+    }
+    if let Some(value) = object.get("backoffBaseMs").and_then(Value::as_u64) {
+        policy.backoff_base_ms = value;
+    }
+    if let Some(value) = object.get("backoffMaxMs").and_then(Value::as_u64) {
+        policy.backoff_max_ms = value;
+    }
+    Ok(policy)
+}
+
+/// 从入参取闸门。**缺省是全开**——平台必须按电量/网络/热状态自己决定；
+/// 这里给缺省值只是为了测试与"前台空闲"这种明确知道可以干的场景。
+fn gate_arg(args: &Value) -> Result<perch_pipeline::Gate, FfiError> {
+    let Some(object) = args.get("gate") else {
+        return Ok(perch_pipeline::Gate::foreground());
+    };
+    Ok(perch_pipeline::Gate {
+        allow_any: object
+            .get("allowAny")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        allow_heavy: object
+            .get("allowHeavy")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    })
+}
+
+/// 从入参取初始状态（`pipeline.enqueue` 用；缺省 `registered`）。
+fn state_arg(args: &Value) -> Result<perch_model::ImportState, FfiError> {
+    let Some(value) = args.get("state") else {
+        return Ok(perch_model::ImportState::Registered);
+    };
+    serde_json::from_value(value.clone())
+        .map_err(|error| FfiError::bad_args(format!("state: {error}")))
+}
+
+/// 从入参取优先级（缺省 `normal`）。
+fn priority_arg(args: &Value) -> Result<perch_pipeline::Priority, FfiError> {
+    Ok(match args.get("priority").and_then(Value::as_str) {
+        None | Some("normal") => perch_pipeline::Priority::Normal,
+        Some("urgent") => perch_pipeline::Priority::Urgent,
+        Some("background") => perch_pipeline::Priority::Background,
+        Some(other) => {
+            return Err(FfiError::bad_args(format!(
+                "未知优先级 {other}（urgent / normal / background）"
+            )));
+        }
+    })
+}
+
+/// 优先级的稳定字符串。
+fn priority_str(priority: perch_pipeline::Priority) -> &'static str {
+    match priority {
+        perch_pipeline::Priority::Urgent => "urgent",
+        perch_pipeline::Priority::Normal => "normal",
+        perch_pipeline::Priority::Background => "background",
+    }
+}
+
+/// 入队结果的稳定字符串。
+fn enqueue_outcome_str(outcome: perch_pipeline::EnqueueOutcome) -> &'static str {
+    match outcome {
+        perch_pipeline::EnqueueOutcome::Queued(_) => "queued",
+        perch_pipeline::EnqueueOutcome::AlreadyPresent => "alreadyPresent",
+        perch_pipeline::EnqueueOutcome::NotNeeded => "notNeeded",
+    }
+}
+
+/// 入队结果落在哪个阶段（`notNeeded` 时为 `null`）。
+fn enqueue_outcome_stage(outcome: perch_pipeline::EnqueueOutcome) -> Option<&'static str> {
+    match outcome {
+        perch_pipeline::EnqueueOutcome::Queued(stage) => Some(stage.as_str()),
+        _ => None,
+    }
+}
+
+/// 调度器统计的 JSON（形状与 `Stats` 字段一一对应）。
+fn stats_json(stats: perch_pipeline::Stats) -> Value {
+    json!({
+        "pendingRefine": stats.pending_refine,
+        "pendingIndex": stats.pending_index,
+        "inFlight": stats.in_flight,
+        "exhausted": stats.exhausted,
+    })
+}
+
+/// 一次 `step` 的结果（形状复用 [`perch_jobs::StepOutcome`]，不另立一套）。
+fn step_outcome_json(outcome: &perch_jobs::StepOutcome, stats: perch_pipeline::Stats) -> Value {
+    let mut value = match outcome {
+        perch_jobs::StepOutcome::Idle => json!({ "outcome": "idle" }),
+        perch_jobs::StepOutcome::Refined { book } => json!({
+            "outcome": "refined",
+            "book": book,
+            "stage": "refine",
+        }),
+        perch_jobs::StepOutcome::Indexed {
+            book,
+            chunks,
+            tokens,
+        } => json!({
+            "outcome": "indexed",
+            "book": book,
+            "stage": "index",
+            "chunks": chunks,
+            "tokens": tokens,
+        }),
+        // ⚠️ 字段名用 `reason` 而不是 `error`：`{"error": {code, message}}` 是 FFI 的
+        // **错误通道**（Dart 的 `invoke` 见到 `error.code` 就抛异常）。业务字段重名
+        // 会让"这一步失败了"和"这次调用失败了"混在一起，排查时非常难受。
+        perch_jobs::StepOutcome::Failed {
+            book,
+            stage,
+            error,
+            attempts,
+        } => json!({
+            "outcome": "failed",
+            "book": book,
+            "stage": stage.as_str(),
+            "reason": error,
+            "attempts": attempts,
+        }),
+        perch_jobs::StepOutcome::Exhausted { book, stage } => json!({
+            "outcome": "exhausted",
+            "book": book,
+            "stage": stage.as_str(),
+        }),
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stats".to_owned(), stats_json(stats));
+    }
+    value
+}
+
+/// 现在（毫秒）。平台不传 `now_ms` 时的缺省值。
+///
+/// 退避重试要看"时间前进"，所以测试里必须能把时钟捏在手里（传 `now_ms`）；
+/// 生产里让 Rust 取系统时间即可。
+fn now_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 /// `std::io::Error` → FFI 错误。
@@ -1628,5 +2012,289 @@ mod tests {
                 .insert_txt(perch_txt::TxtDocument::from_bytes(b"x"))
                 .is_ok()
         );
+    }
+
+    // ---------- 导入管线（pipeline.*，见 docs/13）----------
+
+    /// 造一个测试用的目录：`<dir>/out` 是产物目录，`<dir>/books` 放输入文件。
+    fn pipeline_dirs(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("perch-ffi-pipeline-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(dir.join("books")).unwrap();
+        dir
+    }
+
+    /// 管线句柄的 RAII 包装：**panic 也要把句柄还回去**。
+    ///
+    /// 句柄表是进程级全局的、管线配额只有 1；某个测试 panic 时若没归还，
+    /// 后面的测试会全部以 `PIPELINE_TOO_MANY_OPEN` 失败，把真正的原因埋掉
+    /// （第一版就是这样：一个字段名冲突引发四个测试连环红）。
+    struct PipelineGuard(u64);
+
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) {
+            let _ = dispatch("pipeline.close", &json!({ "handle": self.0 }).to_string());
+        }
+    }
+
+    fn open_pipeline(dir: &std::path::Path) -> PipelineGuard {
+        let out = call_ok(
+            "pipeline.open",
+            &json!({ "out_dir": dir.join("out").to_string_lossy() }).to_string(),
+        );
+        PipelineGuard(out["handle"].as_u64().unwrap())
+    }
+
+    fn step_pipeline(handle: u64, now_ms: u64) -> Value {
+        call_ok(
+            "pipeline.step",
+            &json!({ "handle": handle, "now_ms": now_ms }).to_string(),
+        )
+    }
+
+    #[test]
+    fn pipeline_runs_a_book_to_ready_through_ffi() {
+        let _serial = serial();
+        let dir = pipeline_dirs("ready");
+        let book = perch_model::BookId::new();
+        let book_path = dir.join("books/novel.txt");
+        std::fs::write(
+            &book_path,
+            "第一章 灯塔\n守夜人每天爬上灯塔。\n第二章 归航\n他回来了。",
+        )
+        .unwrap();
+
+        let pipeline = open_pipeline(&dir);
+        let handle = pipeline.0;
+        let enqueued = call_ok(
+            "pipeline.enqueue",
+            &json!({
+                "handle": handle,
+                "book": book,
+                "path": book_path.to_string_lossy(),
+                "format": "txt",
+            })
+            .to_string(),
+        );
+        assert_eq!(enqueued["outcome"], "queued");
+        assert_eq!(enqueued["stage"], "refine");
+
+        // 一次一步：②精修 → ③索引
+        assert_eq!(step_pipeline(handle, 1_000)["outcome"], "refined");
+        let indexed = step_pipeline(handle, 2_000);
+        assert_eq!(indexed["outcome"], "indexed");
+        assert_eq!(indexed["stage"], "index");
+        assert!(indexed["tokens"].as_u64().unwrap() > 0);
+
+        // 队列空了，再 step 是 idle
+        assert_eq!(step_pipeline(handle, 3_000)["outcome"], "idle");
+        let status = call_ok("pipeline.status", &json!({ "handle": handle }).to_string());
+        assert_eq!(status["idle"], true);
+        assert_eq!(status["stats"]["pendingRefine"], 0);
+        assert_eq!(status["stats"]["inFlight"], 0);
+
+        // 状态落到磁盘，而且四个产物文件都在
+        let state = call_ok(
+            "pipeline.state",
+            &json!({ "handle": handle, "book": book }).to_string(),
+        );
+        assert_eq!(state["state"], "ready");
+        let book_dir = dir.join("out").join(book.to_string());
+        for name in ["state.json", "refinement.json", "index.bin", "text.json"] {
+            assert!(book_dir.join(name).exists(), "缺少 {name}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pipeline_recovers_state_and_attempts_after_restart() {
+        let _serial = serial();
+        let dir = pipeline_dirs("recover");
+        let book = perch_model::BookId::new();
+        let book_path = dir.join("books/broken.epub");
+        std::fs::write(&book_path, b"definitely not an epub").unwrap();
+
+        // 第一次运行：②失败一次（attempts=1），然后"App 被杀"
+        let pipeline = open_pipeline(&dir);
+        let handle = pipeline.0;
+        call_ok(
+            "pipeline.enqueue",
+            &json!({
+                "handle": handle,
+                "book": book,
+                "path": book_path.to_string_lossy(),
+                "format": "epub",
+            })
+            .to_string(),
+        );
+        let failed = step_pipeline(handle, 1_000);
+        assert_eq!(failed["outcome"], "failed");
+        assert_eq!(failed["attempts"], 1);
+        call_ok("pipeline.close", &json!({ "handle": handle }).to_string());
+
+        // 第二次运行：open 应当把上次的状态与失败次数报回来
+        let reopened = call_ok(
+            "pipeline.open",
+            &json!({ "out_dir": dir.join("out").to_string_lossy() }).to_string(),
+        );
+        let recovered = reopened["recovered"].as_array().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["book"].as_str().unwrap(), book.to_string());
+        assert_eq!(recovered[0]["state"], "failed");
+        assert_eq!(
+            recovered[0]["attempts"], 1,
+            "失败次数必须持久化，否则重启后无限重试"
+        );
+
+        // 再 enqueue：以磁盘上的状态为准（不同阶段重来），且带上历史失败次数
+        let reopened_pipeline = PipelineGuard(reopened["handle"].as_u64().unwrap());
+        let handle = reopened_pipeline.0;
+        let enqueued = call_ok(
+            "pipeline.enqueue",
+            &json!({
+                "handle": handle,
+                "book": book,
+                "path": book_path.to_string_lossy(),
+                "format": "epub",
+                "state": "registered",
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            enqueued["state"], "failed",
+            "磁盘状态优先于调用方给的初始状态"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pipeline_rejects_bad_arguments_and_wrong_handle_kinds() {
+        let _serial = serial();
+        let dir = pipeline_dirs("args");
+        let pipeline = open_pipeline(&dir);
+        let handle = pipeline.0;
+        let book = perch_model::BookId::new();
+        let book_path = dir.join("books/a.txt");
+        std::fs::write(&book_path, "正文").unwrap();
+
+        // format 必填：嗅探会把损坏的 EPUB 当纯文本收下
+        let no_format = dispatch(
+            "pipeline.enqueue",
+            &json!({
+                "handle": handle,
+                "book": book,
+                "path": book_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        assert_eq!(no_format["error"]["code"], "FFI_BAD_ARGS");
+
+        // book 必须是合法 UUID
+        let bad_book = dispatch(
+            "pipeline.enqueue",
+            &json!({
+                "handle": handle,
+                "book": "not-a-uuid",
+                "path": book_path.to_string_lossy(),
+                "format": "txt",
+            })
+            .to_string(),
+        );
+        assert!(
+            bad_book["error"]["code"] == "FFI_BAD_ARGS",
+            "实际: {bad_book}"
+        );
+
+        // 未知方法名之外，还要挡住"拿错句柄类型"
+        let txt = call_ok(
+            "txt.open",
+            &json!({ "path": book_path.to_string_lossy() }).to_string(),
+        );
+        let txt_handle = txt["handle"].as_u64().unwrap();
+        let wrong = dispatch(
+            "pipeline.step",
+            &json!({ "handle": txt_handle, "now_ms": 1_000 }).to_string(),
+        );
+        assert_eq!(wrong["error"]["code"], "HANDLE_WRONG_KIND");
+        // 反过来：pipeline 句柄不能走 book.close，而且不能被关掉
+        let wrong_close = dispatch("book.close", &json!({ "handle": handle }).to_string());
+        assert_eq!(wrong_close["error"]["code"], "HANDLE_WRONG_KIND");
+        assert_eq!(step_pipeline(handle, 2_000)["outcome"], "idle");
+
+        // 管线只允许一条
+        let second = dispatch(
+            "pipeline.open",
+            &json!({ "out_dir": dir.join("out").to_string_lossy() }).to_string(),
+        );
+        assert_eq!(second["error"]["code"], "PIPELINE_TOO_MANY_OPEN");
+
+        call_ok("txt.close", &json!({ "handle": txt_handle }).to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pipeline_open_reports_resumed_books_and_status_counts() {
+        let _serial = serial();
+        let dir = pipeline_dirs("counts");
+        let pipeline = open_pipeline(&dir);
+        let handle = pipeline.0;
+
+        // 三本书：两本能做完，一本指向不存在的文件（会失败）
+        let good_a = dir.join("books/a.txt");
+        let good_b = dir.join("books/b.txt");
+        std::fs::write(&good_a, "第一章 甲\n正文甲。").unwrap();
+        std::fs::write(&good_b, "第一章 乙\n正文乙。").unwrap();
+
+        let mut books = Vec::new();
+        for (path, format) in [
+            (good_a.clone(), "txt"),
+            (good_b.clone(), "txt"),
+            (dir.join("books/missing.txt"), "txt"),
+        ] {
+            let book = perch_model::BookId::new();
+            books.push(book);
+            call_ok(
+                "pipeline.enqueue",
+                &json!({
+                    "handle": handle,
+                    "book": book,
+                    "path": path.to_string_lossy(),
+                    "format": format,
+                })
+                .to_string(),
+            );
+        }
+
+        // 排队数应当能被看见（书架上的"正在精修 N 本"读它）
+        let status = call_ok("pipeline.status", &json!({ "handle": handle }).to_string());
+        let pending = status["stats"]["pendingRefine"].as_u64().unwrap();
+        assert_eq!(pending, 3, "三本都排着队");
+
+        // 一路做到没有活可干
+        let mut seen = Vec::new();
+        for tick in 0..20 {
+            let outcome = step_pipeline(handle, 1_000 + tick * 10_000);
+            let name = outcome["outcome"].as_str().unwrap_or_default().to_owned();
+            if name == "idle" || name == "exhausted" {
+                seen.push(name);
+                break;
+            }
+            seen.push(name);
+        }
+        assert!(seen.contains(&"refined".to_owned()), "实际: {seen:?}");
+        assert!(seen.contains(&"failed".to_owned()), "实际: {seen:?}");
+
+        // 失败的那本留着 attempts，另两本 ready
+        let missing = call_ok(
+            "pipeline.state",
+            &json!({ "handle": handle, "book": books[2] }).to_string(),
+        );
+        assert_eq!(missing["state"], "failed");
+        assert!(missing["attempts"].as_u64().unwrap() >= 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

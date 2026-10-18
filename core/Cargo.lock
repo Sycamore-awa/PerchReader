@@ -462,6 +462,7 @@ dependencies = [
  "perch-model",
  "perch-pagecurl",
  "perch-pdf",
+ "perch-pipeline",
  "perch-sync",
  "perch-txt",
  "serde",
@@ -497,6 +498,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uuid",
  "zip",
 ]
 

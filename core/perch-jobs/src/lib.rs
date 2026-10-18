@@ -41,8 +41,10 @@
 #![forbid(unsafe_code)]
 
 pub mod pipeline;
+pub mod store;
 
 pub use pipeline::{BookStore, Pipeline, StepOutcome, StepSummary};
+pub use store::{PathStore, Recovered, StateFile};
 
 use perch_epub::{
     EpubArchive, EpubError, Package, TocEntry, XhtmlIndex, flatten_toc, parse_nav, parse_ncx,

@@ -19,6 +19,8 @@ perch-sync.workspace = true
 perch-import.workspace = true
 perch-pdf.workspace = true
 perch-jobs.workspace = true
+# pipeline.* 要用到调度策略 / 闸门 / 统计（Pipeline 的类型参数来自它）
+perch-pipeline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

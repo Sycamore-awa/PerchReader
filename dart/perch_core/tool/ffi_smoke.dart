@@ -13,6 +13,7 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:perch_core/perch_core.dart';
 
@@ -452,6 +453,85 @@ Future<void> main(List<String> args) async {
   }
   readDir.deleteSync(recursive: true);
 
+  // ---- 16) 导入管线（pipeline.*）----
+  //
+  // 平台只给"书在哪"和"产物写哪"，读文件、调度、落盘都在 Rust 里（docs/13）。
+  // 这里用真实文件跑完整条链：登记 → ②精修 → ③索引 → ready + 四个产物文件。
+  stdout.writeln('[16] 导入管线（pipeline.*）');
+
+  final pipelineDir = Directory.systemTemp.createTempSync('perch-pipeline-');
+  final outDir = Directory('${pipelineDir.path}/out')..createSync();
+  final bookPath = File('${pipelineDir.path}/novel.txt')
+    ..writeAsStringSync('第一章 灯塔\n守夜人每天爬上灯塔。\n第二章 归航\n他回来了。', encoding: utf8);
+  final importBookId = _uuidV4();
+
+  final pipelineOpened = core.invoke('pipeline.open', {'out_dir': outDir.path});
+  final pipeline = pipelineOpened['handle'] as int;
+  checkTrue('新目录里没有可恢复的书', (pipelineOpened['recovered'] as List).isEmpty);
+
+  final enqueued = core.invoke('pipeline.enqueue', {
+    'handle': pipeline,
+    'book': importBookId,
+    'path': bookPath.path,
+    'format': 'txt',
+  });
+  check('入队结果', enqueued['outcome'], 'queued');
+  check('入队落在阶段②', enqueued['stage'], 'refine');
+
+  final status = core.invoke('pipeline.status', {'handle': pipeline});
+  check('排队中的书数', (status['stats'] as Map)['pendingRefine'], 1);
+  check('队列不空闲', status['idle'], false);
+
+  // 一次一步：②精修 → ③索引 → 空闲
+  final firstStep = core.invoke('pipeline.step', {'handle': pipeline, 'now_ms': 1000});
+  check('第一步是精修完成', firstStep['outcome'], 'refined');
+  final secondStep = core.invoke('pipeline.step', {'handle': pipeline, 'now_ms': 2000});
+  check('第二步是索引完成', secondStep['outcome'], 'indexed');
+  check('索引有 token', (secondStep['tokens'] as num) > 0, true);
+  final thirdStep = core.invoke('pipeline.step', {'handle': pipeline, 'now_ms': 3000});
+  check('没活可干时是 idle', thirdStep['outcome'], 'idle');
+
+  final stateOut = core.invoke('pipeline.state', {'handle': pipeline, 'book': importBookId});
+  check('这本书的状态', stateOut['state'], 'ready');
+  check('状态可查', stateOut['known'], true);
+
+  // 四个产物文件真的落在磁盘上
+  final bookDir = Directory('${outDir.path}/$importBookId');
+  final names = ['state.json', 'refinement.json', 'index.bin', 'text.json'];
+  for (final name in names) {
+    checkTrue('产物存在：$name', File('${bookDir.path}/$name').existsSync());
+  }
+  // 失败字段不能占用 FFI 的错误通道（`error` 是保留字）
+  checkTrue(
+    'step 结果里没有协议保留字段 error',
+    thirdStep.containsKey('error') == false,
+    'fields=${thirdStep.keys.toList()}',
+  );
+
+  // 管线只允许一条
+  try {
+    core.invoke('pipeline.open', {'out_dir': outDir.path});
+    checkTrue('第二条管线应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('第二条管线的错误码', error.code, 'PIPELINE_TOO_MANY_OPEN');
+  }
+
+  // 拿错句柄类型：要用一个**还活着**的 txt 句柄（[14] 里那些早就 close 了，
+  // 拿已关闭的句柄只会得到 BAD_HANDLE，测不到"类型不符"这条）。
+  final kindFile = File('${pipelineDir.path}/kind.txt')
+    ..writeAsStringSync('一二三四五', encoding: utf8);
+  final kindHandle = core.openTxt(kindFile.path);
+  try {
+    core.invoke('pipeline.step', {'handle': kindHandle.handle, 'now_ms': 4000});
+    checkTrue('拿 txt 句柄调 pipeline 应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('拿错类型的错误码', error.code, 'HANDLE_WRONG_KIND');
+  }
+  kindHandle.close();
+
+  core.invoke('pipeline.close', {'handle': pipeline});
+  pipelineDir.deleteSync(recursive: true);
+
   // ---- 汇总 ----
   stdout.writeln('');
   stdout.writeln('通过 $_passed 项，失败 $_failed 项');
@@ -459,4 +539,17 @@ Future<void> main(List<String> args) async {
     exit(1);
   }
   stdout.writeln('FFI 边界端到端验证通过。');
+}
+
+/// 造一个 v4 UUID 字符串（只给冒烟用）。
+///
+/// 真实 App 里的 BookId 由导入阶段①生成；这里只是需要一个合法的 UUID 形状。
+String _uuidV4() {
+  final random = Random.secure();
+  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+      '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
 }
