@@ -124,6 +124,19 @@ ffi-smoke: core-lib
     cd dart/perch_core && dart pub get
     cd dart/perch_core && dart run tool/ffi_smoke.dart ../../core/target/release/libperch_ffi.so
 
+# App 的启动自检逻辑，跑在 Linux 的真实 .so 上（Android/iOS 上走的是同一条 FFI 契约）。
+# iOS 上的等价物是 CI 的「模拟器冒烟」（docs/12 Step 1）——这里先把逻辑本身验掉，
+# 不必等一轮十几分钟的云 CI。
+app-selfcheck: core-lib
+    cd app && dart run tool/selfcheck_smoke.dart ../core/target/release/libperch_ffi.so
+
+# 用假 xcrun 在 Linux 上验证 CI 的「模拟器冒烟」脚本（通过与失败两条路径）。
+# 目的：CI 脚本最容易坏在 shell 细节（SIGPIPE / 退出码 / 找不到命令），
+# 而这些在真机上是"一轮十几分钟才知道结果"。
+smoke-harness-test:
+    bash tools/test_simulator_smoke.sh pass
+    bash tools/test_simulator_smoke.sh fail
+
 # Dart 静态分析
 # 注意：这里用 dart analyze 而不是 flutter analyze —— 后者在含中文的项目路径下会
 # 抛 FormatException（LSP 通道按字节/字符算错 Content-Length），见 docs/03 环境怪癖

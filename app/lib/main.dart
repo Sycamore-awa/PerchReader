@@ -7,7 +7,12 @@
 // 已知未验证：iOS/Android 上的真实渲染与性能。当前的验证手段是
 //   1) `flutter test` 覆盖业务逻辑（纯 Dart VM，无需设备）
 //   2) 云端 macOS CI 覆盖编译
-//   3) 真机/模拟器上的行为 —— 仍待验证
+//   3) **CI 的模拟器冒烟**：启动 App → 抓下面这行自检日志 → 截图回传
+//      （`docs/12-下一步计划.md` Step 1）
+//
+// 启动自检（[selfCheckCore]）是这条链路的关键一环：它是"App 真的用上了 Rust"
+// 的唯一运行时证据。此前 `app/lib` 从不 import `perch_core`，所以 CI 的符号断言
+// 只证明"符号在 bundle 里"，无法证明 `DynamicLibrary.process()` 解析得到。
 
 import 'dart:async';
 import 'dart:io';
@@ -16,21 +21,67 @@ import 'package:flutter/material.dart';
 import 'package:flutter_readium/flutter_readium.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'core_self_check.dart';
 import 'library.dart';
 
 void main() {
-  runApp(const PerchApp());
+  // 自检刻意放在 runApp **之前**：它证明的是"这个进程能解析到 Rust 符号"，
+  // 与 UI 能否渲染无关。CI 断言这一行日志（格式见 core_self_check.dart）。
+  final selfCheck = selfCheckCore();
+  debugPrint(selfCheck.logLine);
+  runApp(PerchApp(selfCheck: selfCheck));
 }
 
 class PerchApp extends StatelessWidget {
-  const PerchApp({super.key});
+  const PerchApp({super.key, required this.selfCheck});
+
+  /// 启动自检结果（只读，用来在标题栏显示一个状态角标）。
+  final CoreSelfCheck selfCheck;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'PerchReader',
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-      home: const LibraryScreen(),
+      home: LibraryScreen(selfCheck: selfCheck),
+    );
+  }
+}
+
+/// 标题栏上的核心状态角标。
+///
+/// 存在的理由是为了"看得见"：模拟器截图里能直接读出核心是否连上，
+/// 不用去翻日志。核心不可用时也只是变灰，不影响使用（降级而非崩溃）。
+class _CoreBadge extends StatelessWidget {
+  const _CoreBadge({required this.selfCheck});
+
+  final CoreSelfCheck selfCheck;
+
+  @override
+  Widget build(BuildContext context) {
+    final ok = selfCheck.ok;
+    final color = ok ? Colors.teal.shade400 : Colors.grey.shade600;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.only(right: 12),
+        child: Tooltip(
+          message: selfCheck.badgeTooltip,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.15),
+              border: Border.all(color: color),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              child: Text(
+                selfCheck.badgeLabel,
+                style: TextStyle(fontSize: 12, color: color),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -40,7 +91,10 @@ class PerchApp extends StatelessWidget {
 /// 真实的书库应由导入管线（perch-import 的阶段①）填充，这里先用固定清单，
 /// 以便把"打开 → 记录 → 恢复"这条链路先跑通。
 class LibraryScreen extends StatefulWidget {
-  const LibraryScreen({super.key});
+  const LibraryScreen({super.key, required this.selfCheck});
+
+  /// 启动自检结果，显示在标题栏角标上（截图里就能看出核心连没连上）。
+  final CoreSelfCheck selfCheck;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -91,7 +145,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('书库')),
+      appBar: AppBar(
+        title: const Text('书库'),
+        actions: [_CoreBadge(selfCheck: widget.selfCheck)],
+      ),
       body: FutureBuilder<ProgressStore>(
         future: _store,
         builder: (context, snapshot) {

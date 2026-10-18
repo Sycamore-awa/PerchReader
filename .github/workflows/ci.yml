@@ -159,6 +159,9 @@ jobs:
     # （或 `macos-latest` / `macos-26-xlarge`）。**没有** `macos-26-arm64` 这个标签——
     # 写成本来不存在的标签，job 会永远 queued 而不会报错，非常难察觉。
     runs-on: macos-26
+    # 显式超时：默认上限是 6 小时，而"模拟器卡住"这类故障会让 job 一直挂着烧额度。
+    # 正常一轮约 12~18 分钟（含模拟器冒烟）。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -348,6 +351,157 @@ jobs:
           echo "---- ③ __preview.dylib 的动态依赖 ----"
           otool -L "$bundle/__preview.dylib" 2>/dev/null || true
           exit 1
+
+      # 从「能编译」升级到「能跑」（docs/12 的 Step 1b）。
+      #
+      # 为什么必须做：`nm` 断言只证明「符号在 bundle 里」，不证明
+      # 「运行时 DynamicLibrary.process() 解析得到」——后者要进程真的跑起来。
+      # 所以这里把 App 装进模拟器启动，断言启动自检的那行日志
+      # （`[perch-selfcheck] ok core=<版本>`，见 app/lib/core_self_check.dart），
+      # 并把首页截图回传成 artifact：没有 Mac 时这是唯一能「看见」界面的手段。
+      #
+      # 设备名随 Xcode 版本变化，所以设备靠 `simctl list` 动态发现，不写死。
+      - name: 模拟器冒烟（启动 App + 断言自检日志 + 截图）
+        run: |
+          # 注意：GitHub 默认给 `run` 加的是 `bash -e`（不含 pipefail），这里显式补上。
+          # 本步骤**禁止**任何「消费端提前退出」的管道（grep -q / head 读管道）：
+          # 生产者会收 SIGPIPE，在 pipefail 下让整步静默失败（docs/10 §6.2，同类坑已 4 次）。
+          # 需要 grep 时一律读**文件**或 here-string，不用管道。
+          set -uo pipefail
+
+          # 自己实现超时包装：macOS **没有** GNU `timeout`（它是 coreutils 的东西），
+          # GitHub runner 上有没有装 coreutils 不确定 —— 不猜，自己写一个。
+          # 返回 124 表示超时（与 GNU timeout 一致）。
+          run_with_timeout() {
+            limit=$1
+            shift
+            "$@" &
+            child=$!
+            waited=0
+            while kill -0 "$child" 2>/dev/null; do
+              if [ "$waited" -ge "$limit" ]; then
+                kill -9 "$child" 2>/dev/null || true
+                echo "（超时 ${limit}s，已杀掉）"
+                return 124
+              fi
+              sleep 1
+              waited=$((waited + 1))
+            done
+            wait "$child"
+          }
+
+          bundle="app/build/ios/iphonesimulator/Runner.app"
+          artifacts="ci-artifacts"
+          mkdir -p "$artifacts"
+
+          if [ ! -d "$bundle" ]; then
+            echo "::error::没有 $bundle，无法冒烟"
+            ls -la app/build/ios/ 2>/dev/null || true
+            exit 1
+          fi
+
+          # bundle id 从产物里读，不写死（改工程配置时这里不会悄悄失配）
+          bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Info.plist" 2>/dev/null || true)
+          if [ -z "$bundle_id" ]; then
+            bundle_id="com.perch.perch"
+            echo "（读不到 CFBundleIdentifier，回退到 $bundle_id）"
+          fi
+          echo "App：$bundle"
+          echo "bundle id：$bundle_id"
+
+          echo "---- 挑选模拟器设备 ----"
+          devices=$(xcrun simctl list devices available || true)
+          booted=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)) (Booted).*$/\1/p' <<<"$devices")
+          udid=${booted%%$'\n'*}
+          if [ -z "$udid" ]; then
+            any=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)).*$/\1/p' <<<"$devices")
+            udid=${any%%$'\n'*}
+          fi
+          if [ -z "$udid" ]; then
+            echo "::error::没有可用的 iPhone 模拟器"
+            printf '%s\n' "$devices"
+            exit 1
+          fi
+          echo "选中设备：$udid"
+          printf '%s\n' "$devices" | grep -F "$udid" || true
+
+          echo "---- 启动模拟器（最多等 180 秒）----"
+          xcrun simctl boot "$udid" 2>/dev/null || true
+          if ! run_with_timeout 180 xcrun simctl bootstatus "$udid" -b; then
+            echo "::error::模拟器启动超时或失败"
+            exit 1
+          fi
+
+          echo "---- 安装 App ----"
+          if ! run_with_timeout 180 xcrun simctl install "$udid" "$bundle"; then
+            echo "::error::simctl install 失败"
+            exit 1
+          fi
+
+          # 控制台日志落盘：`--console-pty` 会把 App 的 stdout 接到这个文件。
+          # 用后台任务是因为这个命令会一直挂着（App 不退出它就不返回）。
+          console_log="$artifacts/app-console.log"
+          echo "---- 启动 App（控制台日志 → $console_log）----"
+          xcrun simctl launch --console-pty --terminate-running-process "$udid" "$bundle_id" > "$console_log" 2>&1 &
+          launch_pid=$!
+
+          echo "---- 等自检日志（最多 120 秒）----"
+          found=0
+          waited=0
+          while [ "$waited" -lt 120 ]; do
+            if grep -q 'perch-selfcheck' "$console_log" 2>/dev/null; then
+              found=1
+              break
+            fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+          echo "自检日志：$([ "$found" = "1" ] && echo 出现 || echo 未出现)（等了 ${waited}s）"
+
+          # 再等几秒让 Flutter 画出首帧，然后截图。截图失败不影响断言。
+          sleep 8
+          echo "---- 截图 ----"
+          run_with_timeout 60 xcrun simctl io "$udid" screenshot "$artifacts/home.png" 2>&1 \
+            || echo "（截图失败）"
+          ls -la "$artifacts" || true
+
+          echo "---- 控制台日志（前 80 行）----"
+          sed -n '1,80p' "$console_log" || true
+
+          if [ "$found" = "1" ]; then
+            echo "======== 冒烟通过：App 在模拟器上启动，启动自检日志已出现 ========"
+            grep 'perch-selfcheck' "$console_log" || true
+            xcrun simctl terminate "$udid" "$bundle_id" 2>/dev/null || true
+            kill "$launch_pid" 2>/dev/null || true
+            exit 0
+          fi
+
+          echo "======== 失败：App 启动后没有出现 [perch-selfcheck] 日志 ========"
+          echo "---- ① 控制台日志尾 200 行 ----"
+          tail -200 "$console_log" || true
+          echo "---- ② 兜底：系统日志里找自检标记（stdout 有时不转发到控制台）----"
+          run_with_timeout 60 xcrun simctl spawn "$udid" log show --last 3m \
+            --predicate 'process == "Runner"' 2>/dev/null > "$artifacts/system.log" || true
+          grep 'perch-selfcheck' "$artifacts/system.log" || echo "（系统日志里也没有）"
+          echo "---- ③ 崩溃报告 ----"
+          ls -la "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null || echo "（没有诊断报告目录）"
+          echo "---- ④ App 进程是否还在 ----"
+          xcrun simctl spawn "$udid" launchctl list 2>/dev/null | grep -F "$bundle_id" \
+            || echo "（App 进程不在运行，可能是启动即崩溃）"
+          xcrun simctl terminate "$udid" "$bundle_id" 2>/dev/null || true
+          kill "$launch_pid" 2>/dev/null || true
+          echo "::error::模拟器冒烟失败：没有出现 [perch-selfcheck] 日志（截图与日志见 artifact ios-simulator-smoke）"
+          exit 1
+
+      # 不论成败都回传：失败时那几张截图和日志才是最有用的（没有 Mac 时全靠它）。
+      - name: 回传模拟器冒烟产物（截图 + 日志）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-smoke
+          path: ci-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: 汇总
         if: always()
