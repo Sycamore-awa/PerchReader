@@ -32,6 +32,19 @@ else:
     raise SystemExit('没找到「模拟器冒烟」步骤')
 PY
 
+# 1.5) 静态检查：bash 3.2 陷阱。
+#
+# macOS 自带的是 bash 3.2，**不是** UTF-8 感知的：变量名后面紧跟中文/全角字符时，
+# 它会把多字节字符算进变量名 → "unbound variable"。本地是 bash 5，跑起来一切正常，
+# 所以**只有静态检查能提前发现**——2026-10-18 的 CI 就是这么挂的。
+pattern='\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7F])'
+if grep -nP "$pattern" "$tmp/smoke.sh"; then
+  echo "✗ 上面这些变量名后面紧跟非 ASCII：macOS 的 bash 3.2 会在运行时把它算进变量名"
+  echo "  修法：写成 \${var}，或加空格/逗号隔开"
+  exit 1
+fi
+echo "  ✓ 没有「变量名相邻非 ASCII」的写法（bash 3.2 陷阱）"
+
 # 2) 造一个假的 workspace：只有脚本要求的产物路径
 ws="$tmp/ws"
 mkdir -p "$ws/app/build/ios/iphonesimulator/Runner.app"

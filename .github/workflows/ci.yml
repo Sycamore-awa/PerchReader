@@ -94,6 +94,20 @@ jobs:
           fi
           llvm-nm --version | head -1
 
+      # 平台差异检查：macOS 自带的是 bash 3.2，**不是** UTF-8 感知的 —— 变量名后面
+      # 紧跟中文/全角字符时，它会把多字节字符算进变量名，报 "unbound variable"。
+      # 2026-10-18 的 CI 就是这样挂的（一个 echo 里变量后面直接跟了全角括号），
+      # 而 Linux 的 bash 5 完全不会暴露这个问题 —— 所以要在 Linux 侧挡住。
+      # 修法：写成 ${var}，或加个空格/逗号隔开。
+      - name: 检查 CI 脚本里变量名是否相邻非 ASCII（bash 3.2 陷阱）
+        run: |
+          pattern='\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7F])'
+          if grep -nP "$pattern" .github/workflows/ci.yml; then
+            echo "::error::上面这些变量名后面紧跟非 ASCII 字符：macOS 的 bash 3.2 会把它们算进变量名（本项目已在 CI 上挂过一次）。请写成 \${var} 或加空格隔开。"
+            exit 1
+          fi
+          echo "✓ 没有「变量名相邻非 ASCII」的写法"
+
       # 拆成独立步骤（而不是单个 `just ci`）：
       # 这样某一步失败时，**失败的步骤名本身就说明了是哪一环**，
       # 不需要登录看日志也能定位。命令与本地 justfile 完全一致。
@@ -395,7 +409,7 @@ jobs:
           mkdir -p "$artifacts"
 
           if [ ! -d "$bundle" ]; then
-            echo "::error::没有 $bundle，无法冒烟"
+            echo "::error::没有 ${bundle}，无法冒烟"
             ls -la app/build/ios/ 2>/dev/null || true
             exit 1
           fi
@@ -404,18 +418,18 @@ jobs:
           bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Info.plist" 2>/dev/null || true)
           if [ -z "$bundle_id" ]; then
             bundle_id="com.perch.perch"
-            echo "（读不到 CFBundleIdentifier，回退到 $bundle_id）"
+            echo "（读不到 CFBundleIdentifier，回退到 ${bundle_id}）"
           fi
           echo "App：$bundle"
           echo "bundle id：$bundle_id"
 
           echo "---- 挑选模拟器设备 ----"
           devices=$(xcrun simctl list devices available || true)
-          booted=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)) (Booted).*$/\1/p' <<<"$devices")
-          udid=${booted%%$'\n'*}
+          booted_lines=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)) (Booted).*$/\1/p' <<<"$devices")
+          udid=$(printf '%s\n' "$booted_lines" | sed -n '1p')
           if [ -z "$udid" ]; then
-            any=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)).*$/\1/p' <<<"$devices")
-            udid=${any%%$'\n'*}
+            any_lines=$(sed -n 's/^ *iPhone[^(]*(\([0-9A-Fa-f-]\{36\}\)).*$/\1/p' <<<"$devices")
+            udid=$(printf '%s\n' "$any_lines" | sed -n '1p')
           fi
           if [ -z "$udid" ]; then
             echo "::error::没有可用的 iPhone 模拟器"
@@ -441,7 +455,7 @@ jobs:
           # 控制台日志落盘：`--console-pty` 会把 App 的 stdout 接到这个文件。
           # 用后台任务是因为这个命令会一直挂着（App 不退出它就不返回）。
           console_log="$artifacts/app-console.log"
-          echo "---- 启动 App（控制台日志 → $console_log）----"
+          echo "---- 启动 App（控制台日志 → ${console_log}）----"
           xcrun simctl launch --console-pty --terminate-running-process "$udid" "$bundle_id" > "$console_log" 2>&1 &
           launch_pid=$!
 
