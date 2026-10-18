@@ -77,21 +77,27 @@ LIST
     printf 'PNG(dummy)' > "\$out"
     echo "Wrote screenshot to \$out"
     ;;
-  *"simctl launch"*)
-    if [ "$scene" = "pass" ]; then
-      echo "[perch-selfcheck] ok core=0.1.0"
-      echo "flutter: [perch] 打开成功：812 ms"
-    else
-      echo "flutter: 应用启动中……"
-      echo "Lost connection to device."
-    fi
-    sleep 300
-    ;;
+  # 系统日志：Flutter 的 print 走 os_log，自检标记应该从这里出来。
+  # 真实脚本是**轮询** log show（不受 stdout 缓冲影响），所以这里也按轮询模拟：
+  # 通过场景第一次调用就吐出自检行；失败场景永远不吐。
   *"simctl spawn"*"log show"*)
-    echo "（假系统日志：没有自检标记）"
+    if [ "$scene" = "pass" ]; then
+      echo "[2026-10-18 01:51:29.581744+0000] 0x1087a Default 0x0 21518 0 Runner: (Flutter) flutter: [perch-selfcheck] ok core=0.1.0"
+    else
+      echo "（假 log show：Runner 的日志里没有自检标记）"
+    fi
     ;;
   *"simctl spawn"*"launchctl list"*)
     echo "1234  0  com.perch.perch"
+    ;;
+  # 启动 App：**故意不打印自检标记**——真实情况下 --console 抓不到它，
+  # 这正是第一次 CI 实跑暴露的通道问题（见 docs/12）。断言必须靠系统日志。
+  *"simctl launch"*)
+    echo "com.perch.perch: 21518"
+    if [ "$scene" != "pass" ]; then
+      echo "flutter: 应用启动中……"
+      echo "Lost connection to device."
+    fi
     ;;
   *)
     echo "（假 xcrun 未处理：\$args）" >&2
@@ -111,9 +117,16 @@ chmod +x "$bin/sleep"
 # 4) 跑真实步骤脚本（在假 workspace 里跑：CI 的工作目录就是仓库根）
 echo "---- 开始执行 ----"
 set +e
-( cd "$ws" && PATH="$bin:$PATH" bash "$tmp/smoke.sh" ) > "$tmp/out.log" 2>&1
+# 内层脚本套一层 timeout：万一又出现「变量被覆盖导致 while 计数不涨」那类死循环，
+# 这里会以 124 明确失败，而不是把整个 harness 挂死（第一版就是这样被挂住的）。
+( cd "$ws" && PATH="$bin:$PATH" timeout 120 bash "$tmp/smoke.sh" ) > "$tmp/out.log" 2>&1
 code=$?
 set -e
+if [ "$code" = "124" ]; then
+  echo "✗ 内层脚本 120 秒没结束 —— 很可能又是死循环（检查 CI 脚本里的 while 计数有没有被函数覆盖）"
+  tail -20 "$tmp/out.log"
+  exit 1
+fi
 
 echo "退出码：$code（期望：pass=0 / fail=1）"
 echo "---- 输出（尾 25 行）----"
@@ -138,7 +151,15 @@ if [ "$scene" = "pass" ]; then
     echo "✗ 通过场景应当留下控制台日志"
     exit 1
   fi
-  echo "✓ 通过场景：退出码 0 + 截图 + 控制台日志都在"
+  if [ ! -f "$ws/ci-artifacts/log-show.log" ]; then
+    echo "✗ 通过场景应当留下系统日志（自检断言的主通道）"
+    exit 1
+  fi
+  if ! grep -q 'perch-selfcheck' "$ws/ci-artifacts/log-show.log"; then
+    echo "✗ 系统日志里应当有自检标记"
+    exit 1
+  fi
+  echo "✓ 通过场景：退出码 0 + 截图 + log show 里有自检标记 + 控制台日志都在"
 else
   # 失败场景要能**说出原因**，而不是静默退出
   if ! grep -q '没有出现 \[perch-selfcheck\] 日志' "$tmp/out.log"; then

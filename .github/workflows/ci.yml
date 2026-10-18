@@ -386,20 +386,26 @@ jobs:
           # 自己实现超时包装：macOS **没有** GNU `timeout`（它是 coreutils 的东西），
           # GitHub runner 上有没有装 coreutils 不确定 —— 不猜，自己写一个。
           # 返回 124 表示超时（与 GNU timeout 一致）。
+          # ⚠️ 变量必须 local：这个函数被放在轮询循环里调用，而 bash 的函数变量
+          # 默认是**全局**的 —— 第一版把外层循环的 timed_out 覆盖成函数内部的计数，
+          # 导致外层 `while` 的计数永远涨不上去（无限循环）。harness 抓到的就是这个。
+          # （`local` 在 macOS 的 bash 3.2 上同样可用。）
           run_with_timeout() {
-            limit=$1
+            local limit=$1
+            local child
+            local ticks
             shift
             "$@" &
             child=$!
-            waited=0
+            ticks=0
             while kill -0 "$child" 2>/dev/null; do
-              if [ "$waited" -ge "$limit" ]; then
+              if [ "$ticks" -ge "$limit" ]; then
                 kill -9 "$child" 2>/dev/null || true
                 echo "（超时 ${limit}s，已杀掉）"
                 return 124
               fi
               sleep 1
-              waited=$((waited + 1))
+              ticks=$((ticks + 1))
             done
             wait "$child"
           }
@@ -452,25 +458,36 @@ jobs:
             exit 1
           fi
 
-          # 控制台日志落盘：`--console-pty` 会把 App 的 stdout 接到这个文件。
-          # 用后台任务是因为这个命令会一直挂着（App 不退出它就不返回）。
+          # 日志通道：**Flutter 的 print/debugPrint 走 os_log，不走 stdout** ——
+          # 第一次实跑就是栽在这上面：自检日志明明出现了，却因为只查
+          # `--console-pty` 而误判失败（见 docs/12「第一次 CI 实跑」）。
+          #
+          # 所以断言主通道用 `log show` 轮询：每次都是新进程、直接读日志库，
+          # **不受 stdout 缓冲影响**（实时流重定向到文件时可能整块缓冲，120 秒内
+          # 都刷不出来 —— 不赌这个）。这条通道是第一次实跑验证过的。
           console_log="$artifacts/app-console.log"
-          echo "---- 启动 App（控制台日志 → ${console_log}）----"
-          xcrun simctl launch --console-pty --terminate-running-process "$udid" "$bundle_id" > "$console_log" 2>&1 &
-          launch_pid=$!
+          system_log="$artifacts/log-show.log"
+          : > "$console_log"
+          : > "$system_log"
+
+          echo "---- 启动 App ----"
+          xcrun simctl launch --terminate-running-process "$udid" "$bundle_id" > "$console_log" 2>&1 || true
 
           echo "---- 等自检日志（最多 120 秒）----"
-          found=0
-          waited=0
-          while [ "$waited" -lt 120 ]; do
-            if grep -q 'perch-selfcheck' "$console_log" 2>/dev/null; then
-              found=1
+          found=""
+          waited_s=0
+          while [ "$waited_s" -lt 120 ]; do
+            run_with_timeout 30 xcrun simctl spawn "$udid" log show --last 1m \
+              --style compact --predicate 'process == "Runner"' \
+              >> "$system_log" 2>/dev/null || true
+            if grep -q 'perch-selfcheck' "$system_log"; then
+              found="$system_log"
               break
             fi
-            sleep 2
-            waited=$((waited + 2))
+            sleep 6
+            waited_s=$((waited_s + 9))
           done
-          echo "自检日志：$([ "$found" = "1" ] && echo 出现 || echo 未出现)（等了 ${waited}s）"
+          echo "自检日志：$([ -n "$found" ] && echo 出现 || echo 未出现)（等了 ${waited_s}s）"
 
           # 再等几秒让 Flutter 画出首帧，然后截图。截图失败不影响断言。
           sleep 8
@@ -479,31 +496,35 @@ jobs:
             || echo "（截图失败）"
           ls -la "$artifacts" || true
 
-          echo "---- 控制台日志（前 80 行）----"
-          sed -n '1,80p' "$console_log" || true
+          echo "---- 系统日志（前 40 行）----"
+          sed -n '1,40p' "$system_log" || true
+          echo "---- 控制台日志（前 40 行）----"
+          sed -n '1,40p' "$console_log" || true
 
-          if [ "$found" = "1" ]; then
+          if [ -n "$found" ]; then
             echo "======== 冒烟通过：App 在模拟器上启动，启动自检日志已出现 ========"
-            grep 'perch-selfcheck' "$console_log" || true
+            echo "命中通道：${found}"
+            grep 'perch-selfcheck' "$found" || true
+            echo "→ 这行日志同时证明：Rust 符号在运行时解析得到（DynamicLibrary.process 可用）"
             xcrun simctl terminate "$udid" "$bundle_id" 2>/dev/null || true
-            kill "$launch_pid" 2>/dev/null || true
             exit 0
           fi
 
           echo "======== 失败：App 启动后没有出现 [perch-selfcheck] 日志 ========"
-          echo "---- ① 控制台日志尾 200 行 ----"
-          tail -200 "$console_log" || true
-          echo "---- ② 兜底：系统日志里找自检标记（stdout 有时不转发到控制台）----"
-          run_with_timeout 60 xcrun simctl spawn "$udid" log show --last 3m \
-            --predicate 'process == "Runner"' 2>/dev/null > "$artifacts/system.log" || true
-          grep 'perch-selfcheck' "$artifacts/system.log" || echo "（系统日志里也没有）"
+          echo "---- ① 系统日志尾 200 行 ----"
+          tail -200 "$system_log" || true
+          echo "---- ② 控制台日志尾 100 行 ----"
+          tail -100 "$console_log" || true
           echo "---- ③ 崩溃报告 ----"
           ls -la "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null || echo "（没有诊断报告目录）"
           echo "---- ④ App 进程是否还在 ----"
           xcrun simctl spawn "$udid" launchctl list 2>/dev/null | grep -F "$bundle_id" \
             || echo "（App 进程不在运行，可能是启动即崩溃）"
+          echo "---- ⑤ 再看一眼全量系统日志（最近 3 分钟）----"
+          run_with_timeout 60 xcrun simctl spawn "$udid" log show --last 3m \
+            --predicate 'process == "Runner"' 2>/dev/null > "$artifacts/system-show.log" || true
+          grep 'perch-selfcheck' "$artifacts/system-show.log" || echo "（log show 里也没有）"
           xcrun simctl terminate "$udid" "$bundle_id" 2>/dev/null || true
-          kill "$launch_pid" 2>/dev/null || true
           echo "::error::模拟器冒烟失败：没有出现 [perch-selfcheck] 日志（截图与日志见 artifact ios-simulator-smoke）"
           exit 1
 
