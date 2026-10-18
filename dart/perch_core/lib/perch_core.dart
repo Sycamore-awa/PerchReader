@@ -19,6 +19,9 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+// 后台 isolate 门面（UI 不被同步 FFI 堵住，见 docs/11 §5.2 ②）
+export 'perch_worker.dart';
+
 /// `perch_call` 的 C 签名。
 typedef _PerchCallNative = Pointer<Utf8> Function(
   Pointer<Uint8> methodPtr,

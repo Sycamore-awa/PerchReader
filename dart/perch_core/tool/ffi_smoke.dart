@@ -42,7 +42,7 @@ void checkTrue(String name, bool condition, [String? detail]) {
   }
 }
 
-void main(List<String> args) {
+Future<void> main(List<String> args) async {
   final libraryPath = args.isNotEmpty
       ? args.first
       : '../core/target/release/libperch_ffi.so';
@@ -328,6 +328,49 @@ void main(List<String> args) {
   // 不给 format 时按内容嗅探，也应当认出这是纯文本
   final sniffed = core.refineBook(utf8.encode('纯文本'));
   checkTrue('嗅探认出了纯文本', (sniffed['charCount'] as num) > 0, 'out=$sniffed');
+
+  // ---- 15) 后台 isolate（UI 不被堵住的前提）----
+  //
+  // 同步 FFI 直接放在 build/initState 里会堵死 UI isolate（10MB 解码是几百毫秒）。
+  // 这里验证：worker 能起来、能调用、错误码跨 isolate 不丢、dispose 后明确失败。
+  stdout.writeln('[15] 后台 isolate（PerchWorker）');
+
+  final worker = await PerchWorker.spawn(libraryPath: libraryPath);
+  final workerVersion = await worker.call('version');
+  check('worker 里能取到核心版本（与主 isolate 一致）', workerVersion['core'], version);
+
+  final workerDir = Directory.systemTemp.createTempSync('perch-worker-');
+  final workerFile = File('${workerDir.path}/w.txt');
+  workerFile.writeAsStringSync('第一章 灯塔\n守夜人。', encoding: utf8);
+
+  final workerInfo = await worker.call('txt.open', {'path': workerFile.path});
+  final workerHandle = workerInfo['handle'] as int;
+  check('worker 里打开的 TXT 字符数', workerInfo['chars'], 11);
+  final workerSlice = await worker.call('txt.slice', {
+    'handle': workerHandle,
+    'start': 0,
+    'chars': 3,
+  });
+  check('worker 里的切片', workerSlice['text'], '第一章');
+
+  // 业务错误跨 isolate 之后仍是同一个类型与错误码
+  try {
+    await worker.call('txt.slice', {'handle': workerHandle, 'chars': 0});
+    checkTrue('worker 里的错误应当抛出', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('错误码跨 isolate 不丢', error.code, 'TXT_SLICE_BAD_SIZE');
+  }
+
+  await worker.call('txt.close', {'handle': workerHandle});
+  await worker.dispose();
+  try {
+    await worker.call('version');
+    checkTrue('dispose 之后调用应当抛 StateError', false, '没有抛异常');
+  } on StateError {
+    checkTrue('dispose 之后调用 → StateError', true);
+  }
+  workerDir.deleteSync(recursive: true);
+
 
   // ---- 14) TXT 阅读路径（句柄化）----
   //
