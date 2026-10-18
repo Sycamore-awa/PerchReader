@@ -329,6 +329,86 @@ void main(List<String> args) {
   final sniffed = core.refineBook(utf8.encode('纯文本'));
   checkTrue('嗅探认出了纯文本', (sniffed['charCount'] as num) > 0, 'out=$sniffed');
 
+  // ---- 14) TXT 阅读路径（句柄化）----
+  //
+  // 与 [13] 的区别：[13] 走的是 import 阶段的 `txt.analyze`（全文进 JSON），
+  // 这里走的是阅读路径 —— 打开一次，之后每次只取一屏。10MB 的书就看这条。
+  stdout.writeln('[14] TXT 阅读路径（txt.open / slice / locate / offset / line / close）');
+
+  final readDir = Directory.systemTemp.createTempSync('perch-txt-read-');
+  final readFile = File('${readDir.path}/read.txt');
+  const readText = '第一章 灯塔\n\n守夜人每天爬上灯塔。\n第二行在这里。';
+  readFile.writeAsStringSync(readText, encoding: utf8);
+
+  final reader = core.openTxt(readFile.path);
+  check('编码探测', reader.encoding, 'UTF-8');
+  check('编码是否确定', reader.certain, true);
+  check('字符数（不是字节数）', reader.chars, readText.runes.length);
+  check('行数', reader.lines, readText.split('\n').length);
+
+  final slice = reader.slice(3, 5);
+  check('切片文本', slice.text, String.fromCharCodes(readText.runes.skip(3).take(5)));
+  check('切片起点', slice.start, 3);
+  check('切片末尾偏移', slice.end, 8);
+  check('全书总字符数', slice.total, readText.runes.length);
+
+  // 变量名别用 locator：上面 [12] 段已经有一个同名的了（同一作用域）
+  final readLocator = reader.locate(5);
+  check('Locator 带 txtOffset', (readLocator['perch'] as Map)['txtOffset'], 5);
+  check('Locator 能还原字符偏移', reader.offsetOf(readLocator), 5);
+  check('行号', reader.lineAt(5).line, 0);
+  checkTrue('行区间是个有效区间', (reader.lineAt(5).end ?? 0) > (reader.lineAt(5).start ?? -1));
+
+  // 类型不能混用：拿 txt 句柄去 book.close 必须被拒绝，**且不能真把它关掉**
+  try {
+    core.closeBook(reader.handle);
+    checkTrue('txt 句柄调 book.close 应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('类型不符的错误码', error.code, 'HANDLE_WRONG_KIND');
+  }
+  check('被拒绝后句柄仍然可用', reader.slice(0, 1).text, '第');
+
+  // 配额：TXT 与"书索引"**分开计数**，上限 4 个
+  final handles = <TxtHandle>[reader];
+  for (var i = 0; i < 3; i++) {
+    handles.add(core.openTxt(readFile.path));
+  }
+  try {
+    core.openTxt(readFile.path);
+    checkTrue('超过 TXT 配额应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('TXT 配额错误码', error.code, 'TXT_TOO_MANY_OPEN');
+  }
+
+  // 关掉一个就腾出名额，且**新句柄不与旧的复用**（复用会让旧引用误操作到新对象）
+  final freed = handles.removeLast();
+  freed.close();
+  final reopened = core.openTxt(readFile.path);
+  checkTrue('关掉一个后能再开', reopened.handle != freed.handle,
+      '复用了旧句柄 ${reopened.handle}');
+  handles.add(reopened);
+
+  // 取整本书必须明确失败，而不是悄悄传一个巨大的字符串
+  try {
+    reader.slice(0, 1000000);
+    checkTrue('一次要一百万个字符应当报错', false, '没有抛异常');
+  } on PerchCoreException catch (error) {
+    check('切片过大的错误码', error.code, 'TXT_SLICE_BAD_SIZE');
+  }
+
+  // Dart 侧的兜底：close 之后再调，给的是可读的 StateError，而不是核心的 BAD_HANDLE
+  reader.close();
+  try {
+    reader.slice(0, 1);
+    checkTrue('close 之后再切片应当抛 StateError', false, '没有抛异常');
+  } on StateError {
+    checkTrue('close 之后再切片 → StateError', true);
+  }
+  for (final handle in handles) {
+    handle.close();
+  }
+  readDir.deleteSync(recursive: true);
+
   // ---- 汇总 ----
   stdout.writeln('');
   stdout.writeln('通过 $_passed 项，失败 $_failed 项');

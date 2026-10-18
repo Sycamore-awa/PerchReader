@@ -50,6 +50,19 @@ const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 同时把最坏内存占用兜住。
 const MAX_OPEN_BOOKS: usize = 8;
 
+/// 同时最多允许多少个 TXT 阅读句柄。
+///
+/// 与 [`MAX_OPEN_BOOKS`] **分开计数**（见 [`Registry`]）：阅读器同一时刻只需要
+/// 1 个 TXT，留到 4 是给"桌面/平板分栏 + 搜索面板"的余量。分开计数的意义是
+/// **后台建索引的任务再多，也挤不掉阅读句柄**（`docs/11` §5.2 ① 的要求）。
+const MAX_OPEN_TXT: usize = 4;
+
+/// 一次 `txt.slice` 最多返回多少字符。
+///
+/// 阅读器一次只画一屏（几 KB），给到 2 万字符已经远超需要。设上限是为了
+/// **让"误把整本书取回来"这件事明确失败**，而不是悄悄传一个 10MB 的字符串。
+const MAX_TXT_SLICE_CHARS: u64 = 20_000;
+
 /// 一次搜索默认最多返回多少条。
 ///
 /// 搜索面板一次也展示不了更多；上限小一点也能让大书上的单次调用更快。
@@ -61,6 +74,28 @@ struct OpenBook {
     index: perch_index::Index,
 }
 
+/// 句柄表里的一类东西。
+///
+/// **两类分开**：`book.*` 走索引/搜索（阶段③的产物），`txt.*` 走阅读路径。
+/// 各有独立配额，也各有独立的错误码——"书太多"和"阅读句柄被后台任务占满"
+/// 是两种完全不同的故障，混成一个码会让排查和降级都变难（`docs/11` §5.2 ①）。
+enum OpenDoc {
+    /// 已建索引的书：`book.open` 产出。
+    Book(OpenBook),
+    /// 已解码的 TXT：`txt.open` 产出，**不建倒排索引**。
+    Txt(perch_txt::TxtDocument),
+}
+
+impl OpenDoc {
+    /// 类型名，只用于错误信息。
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Book(_) => "book",
+            Self::Txt(_) => "txt",
+        }
+    }
+}
+
 /// 有状态对象的句柄表。
 ///
 /// Dart 侧拿到的是 `u64` 句柄；真正的 Rust 对象留在这里。
@@ -69,7 +104,11 @@ struct OpenBook {
 #[derive(Default)]
 struct Registry {
     next: u64,
-    open: std::collections::HashMap<u64, OpenBook>,
+    open: std::collections::HashMap<u64, OpenDoc>,
+    /// 当前打开的索引句柄数。
+    books: usize,
+    /// 当前打开的 TXT 句柄数。
+    txts: usize,
 }
 
 static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
@@ -87,26 +126,91 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 }
 
 impl Registry {
-    fn insert(&mut self, book: OpenBook) -> Result<u64, FfiError> {
-        if self.open.len() >= MAX_OPEN_BOOKS {
-            return Err(FfiError::new(
-                "BOOK_TOO_MANY_OPEN",
-                format!("同时最多打开 {MAX_OPEN_BOOKS} 本书，请先 close"),
-            ));
-        }
+    /// 放进一个对象，返回新句柄。**分配与配额分开**：配额检查在调用方。
+    fn push(&mut self, doc: OpenDoc) -> u64 {
         let handle = self.next;
         self.next = self.next.saturating_add(1);
-        self.open.insert(handle, book);
+        self.open.insert(handle, doc);
+        handle
+    }
+
+    /// 登记一个索引句柄（受 [`MAX_OPEN_BOOKS`] 限制）。
+    fn insert_book(&mut self, book: OpenBook) -> Result<u64, FfiError> {
+        if self.books >= MAX_OPEN_BOOKS {
+            return Err(FfiError::new(
+                "BOOK_TOO_MANY_OPEN",
+                format!("同时最多打开 {MAX_OPEN_BOOKS} 本书的索引，请先 book.close"),
+            ));
+        }
+        let handle = self.push(OpenDoc::Book(book));
+        self.books += 1;
         Ok(handle)
     }
 
-    fn get(&self, handle: u64) -> Result<&OpenBook, FfiError> {
-        self.open.get(&handle).ok_or_else(|| {
-            FfiError::new(
+    /// 登记一个 TXT 阅读句柄（受 [`MAX_OPEN_TXT`] 限制）。
+    fn insert_txt(&mut self, document: perch_txt::TxtDocument) -> Result<u64, FfiError> {
+        if self.txts >= MAX_OPEN_TXT {
+            return Err(FfiError::new(
+                "TXT_TOO_MANY_OPEN",
+                format!("同时最多打开 {MAX_OPEN_TXT} 个 TXT，请先 txt.close"),
+            ));
+        }
+        let handle = self.push(OpenDoc::Txt(document));
+        self.txts += 1;
+        Ok(handle)
+    }
+
+    /// 摘掉一个句柄，并维护计数。
+    fn remove(&mut self, handle: u64) -> Option<OpenDoc> {
+        let doc = self.open.remove(&handle)?;
+        match doc {
+            OpenDoc::Book(_) => self.books = self.books.saturating_sub(1),
+            OpenDoc::Txt(_) => self.txts = self.txts.saturating_sub(1),
+        }
+        Some(doc)
+    }
+
+    /// 借一个索引句柄；句柄不存在或**类型不对**时给不同的错误码。
+    fn book(&self, handle: u64) -> Result<&OpenBook, FfiError> {
+        match self.open.get(&handle) {
+            Some(OpenDoc::Book(book)) => Ok(book),
+            Some(other) => Err(FfiError::new(
+                "HANDLE_WRONG_KIND",
+                format!(
+                    "句柄 {handle} 是 {} 类型，book.* 用不了；该用 {}.close 释放",
+                    other.kind(),
+                    other.kind()
+                ),
+            )),
+            None => Err(FfiError::new(
                 "BOOK_BAD_HANDLE",
                 format!("句柄 {handle} 不存在（可能已 close 或从未 open）"),
-            )
-        })
+            )),
+        }
+    }
+
+    /// 借一个 TXT 句柄。
+    fn txt(&self, handle: u64) -> Result<&perch_txt::TxtDocument, FfiError> {
+        match self.open.get(&handle) {
+            Some(OpenDoc::Txt(document)) => Ok(document),
+            Some(other) => Err(FfiError::new(
+                "HANDLE_WRONG_KIND",
+                format!(
+                    "句柄 {handle} 是 {} 类型，txt.* 用不了；该用 {}.close 释放",
+                    other.kind(),
+                    other.kind()
+                ),
+            )),
+            None => Err(FfiError::new(
+                "TXT_BAD_HANDLE",
+                format!("句柄 {handle} 不存在（可能已 close 或从未 open）"),
+            )),
+        }
+    }
+
+    /// 判断句柄是不是某一类（给 `*.close` 用，避免关错类型）。
+    fn kind_of(&self, handle: u64) -> Option<&'static str> {
+        self.open.get(&handle).map(OpenDoc::kind)
     }
 }
 
@@ -212,7 +316,7 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
             let char_count = text.char_count();
             let chapter_count = text.chapters.len();
             let truncated = text.truncated;
-            let handle = registry().insert(OpenBook { text, index })?;
+            let handle = registry().insert_book(OpenBook { text, index })?;
             Ok(json!({
                 "handle": handle,
                 "charCount": char_count,
@@ -232,7 +336,7 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
                 .and_then(Value::as_u64)
                 .map_or(DEFAULT_SEARCH_LIMIT, |n| n as usize);
             let guard = registry();
-            let book = guard.get(handle)?;
+            let book = guard.book(handle)?;
             let hits: Vec<Value> = book
                 .index
                 .search(query)
@@ -254,7 +358,166 @@ fn call(method: &str, args: &str) -> Result<Value, FfiError> {
         // 释放一本书的索引。
         "book.close" => {
             let handle = required_u64(&args, "handle")?;
-            let removed = registry().open.remove(&handle).is_some();
+            let mut guard = registry();
+            // 类型不对就不关：拿 txt 句柄调 book.close 是调用方的 bug，
+            // 静默关掉会让真正的持有者后续拿到 BAD_HANDLE，很难定位。
+            if let Some(kind) = guard.kind_of(handle) {
+                if kind != "book" {
+                    return Err(FfiError::new(
+                        "HANDLE_WRONG_KIND",
+                        format!("句柄 {handle} 是 {kind} 类型，请用 {kind}.close"),
+                    ));
+                }
+            }
+            let removed = guard.remove(handle).is_some();
+            Ok(json!({ "closed": removed }))
+        }
+
+        // ---- TXT 阅读路径（perch-txt）----
+        //
+        // 为什么句柄化：`txt.analyze` 要 `bytes_hex`（10MB 文件 = 20MB 十六进制字符串）
+        // 而且把**全文**当 JSON 字符串吐回来。阅读路径只需要"打开一次 + 每次取一屏"，
+        // 所以走 `txt.open` + `txt.slice`（`docs/11` §5.2 ①）。
+        "txt.open" => {
+            let path = required_str(&args, "path")?;
+            let document = match args.get("encoding").and_then(Value::as_str) {
+                // 显式指定编码：跳过探测（探测在极短的文本上会猜错）
+                Some(label) => {
+                    let bytes = std::fs::read(path).map_err(txt_io_error)?;
+                    perch_txt::TxtDocument::with_encoding(&bytes, label).ok_or_else(|| {
+                        FfiError::new("TXT_UNKNOWN_ENCODING", format!("不认识的编码: {label}"))
+                    })?
+                }
+                // 默认：BOM → 合法 UTF-8 → chardetng 猜测
+                None => perch_txt::TxtDocument::open(path).map_err(txt_io_error)?,
+            };
+            let meta = document.meta();
+            let chars = meta.chars;
+            let lines = meta.lines;
+            // `encoding` 是 `&'static str`，直接拷贝引用即可（不是 String）
+            let encoding = meta.encoding;
+            let certain = meta.certain_encoding;
+            let had_errors = meta.had_decode_errors;
+            let handle = registry().insert_txt(document)?;
+            Ok(json!({
+                "handle": handle,
+                "chars": chars,
+                "lines": lines,
+                "encoding": encoding,
+                "certain": certain,
+                "hadErrors": had_errors,
+            }))
+        }
+
+        // 取一屏文本。`start` 是字符偏移（跨端最稳的锚点就是它），`chars` 必填且有上限。
+        "txt.slice" => {
+            let handle = required_u64(&args, "handle")?;
+            let start = args.get("start").and_then(Value::as_u64).unwrap_or(0);
+            let want = required_u64(&args, "chars")?;
+            if want == 0 || want > MAX_TXT_SLICE_CHARS {
+                return Err(FfiError::new(
+                    "TXT_SLICE_BAD_SIZE",
+                    format!("chars 必须在 1..={MAX_TXT_SLICE_CHARS} 之间（收到 {want}）"),
+                ));
+            }
+            let guard = registry();
+            let document = guard.txt(handle)?;
+            let total = document.char_count();
+            if start > total {
+                return Err(FfiError::new(
+                    "TXT_OUT_OF_RANGE",
+                    format!("start {start} 超出总字符数 {total}"),
+                ));
+            }
+            // 末尾不足一屏是正常情况（最后一页），按实际长度返回
+            let end = start.saturating_add(want).min(total);
+            let text = document.text_range(start..end).ok_or_else(|| {
+                FfiError::new(
+                    "TXT_OUT_OF_RANGE",
+                    format!("取不到 [{start}, {end}) 这一段（总字符数 {total}）"),
+                )
+            })?;
+            Ok(json!({
+                "text": text,
+                "start": start,
+                "end": end,
+                "chars": end.saturating_sub(start),
+                "total": total,
+            }))
+        }
+
+        // 字符偏移 → Locator（进度落库用这个）。
+        "txt.locate" => {
+            let handle = required_u64(&args, "handle")?;
+            let char_offset = required_u64(&args, "char")?;
+            let guard = registry();
+            let document = guard.txt(handle)?;
+            let locator = document.locator(char_offset).ok_or_else(|| {
+                FfiError::new(
+                    "TXT_OUT_OF_RANGE",
+                    format!(
+                        "字符偏移 {char_offset} 超出总字符数 {}",
+                        document.char_count()
+                    ),
+                )
+            })?;
+            Ok(json!({ "locator": locator }))
+        }
+
+        // Locator → 字符偏移。**解析不出来不是错误**：返回 `{"char": null}`，
+        // 让人调用方决定是不是退回 progression（三级回退链在文档里）。
+        "txt.offset" => {
+            let handle = required_u64(&args, "handle")?;
+            let locator: Locator = serde_json::from_value(
+                args.get("locator")
+                    .cloned()
+                    .ok_or_else(|| FfiError::bad_args("缺少 locator"))?,
+            )
+            .map_err(|error| FfiError::bad_args(format!("locator: {error}")))?;
+            let guard = registry();
+            let document = guard.txt(handle)?;
+            match document.char_offset_of_locator(&locator) {
+                Some(char_offset) => Ok(json!({ "char": char_offset, "resolved": true })),
+                None => Ok(json!({ "char": null, "resolved": false })),
+            }
+        }
+
+        // 字符偏移 → 行号与该行的字符区间（阅读器排版/目录用）。
+        "txt.line" => {
+            let handle = required_u64(&args, "handle")?;
+            let char_offset = required_u64(&args, "char")?;
+            let guard = registry();
+            let document = guard.txt(handle)?;
+            let line = document.line_index_at(char_offset).ok_or_else(|| {
+                FfiError::new(
+                    "TXT_OUT_OF_RANGE",
+                    format!(
+                        "字符偏移 {char_offset} 超出总字符数 {}",
+                        document.char_count()
+                    ),
+                )
+            })?;
+            let range = document.line_char_range(line);
+            Ok(json!({
+                "line": line,
+                "start": range.as_ref().map(|r| r.start),
+                "end": range.as_ref().map(|r| r.end),
+                "totalLines": document.line_count(),
+            }))
+        }
+
+        "txt.close" => {
+            let handle = required_u64(&args, "handle")?;
+            let mut guard = registry();
+            if let Some(kind) = guard.kind_of(handle) {
+                if kind != "txt" {
+                    return Err(FfiError::new(
+                        "HANDLE_WRONG_KIND",
+                        format!("句柄 {handle} 是 {kind} 类型，请用 {kind}.close"),
+                    ));
+                }
+            }
+            let removed = guard.remove(handle).is_some();
             Ok(json!({ "closed": removed }))
         }
 
@@ -428,6 +691,14 @@ fn format_arg(args: &Value) -> Result<Option<Format>, FfiError> {
     }
 }
 
+/// `std::io::Error` → FFI 错误。
+///
+/// 给稳定错误码而不是把 io 错误当成参数错误：读不到文件和参数写错是两回事，
+/// 调用方（Dart）对它们的降级方式也不同。
+fn txt_io_error(error: std::io::Error) -> FfiError {
+    FfiError::new("TXT_IO", format!("读取失败: {error}"))
+}
+
 /// 取一个必填的无符号整数字段。
 fn required_u64(args: &Value, field: &str) -> Result<u64, FfiError> {
     args.get(field)
@@ -563,6 +834,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    /// 句柄表是**进程级全局**的：这些测试共用它，必须串行跑——
+    /// 并行会把 TXT/书的配额互相占满，表现为"随机某个测试报 TOO_MANY_OPEN"
+    /// （第一版就踩到了）。用局部 `Registry` 的测试不需要这把锁。
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        match REGISTRY_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     fn call_ok(method: &str, args: &str) -> Value {
         let value = dispatch(method, args);
@@ -916,6 +1199,7 @@ mod tests {
 
     #[test]
     fn book_open_reports_index_stats() {
+        let _serial = serial();
         let handle = open_book();
         let args = json!({ "bytes_hex": hex(&epub_fixture()) }).to_string();
         let out = dispatch("book.open", &args);
@@ -932,6 +1216,7 @@ mod tests {
 
     #[test]
     fn book_search_returns_locator_pointing_at_the_chapter() {
+        let _serial = serial();
         let handle = open_book();
         let args = json!({ "handle": handle, "query": "春天的花开" }).to_string();
         let out = dispatch("book.search", &args);
@@ -948,6 +1233,7 @@ mod tests {
 
     #[test]
     fn book_search_miss_returns_empty() {
+        let _serial = serial();
         let handle = open_book();
         let args = json!({ "handle": handle, "query": "完全不存在的词" }).to_string();
         let out = dispatch("book.search", &args);
@@ -957,6 +1243,7 @@ mod tests {
 
     #[test]
     fn closed_handle_is_rejected_not_misused() {
+        let _serial = serial();
         let handle = open_book();
         let closed = dispatch("book.close", &json!({ "handle": handle }).to_string());
         assert_eq!(closed["closed"], true);
@@ -994,13 +1281,15 @@ mod tests {
             )
             .unwrap();
             let index = perch_jobs::index_book(&book, 64);
-            handles.push(local.insert(OpenBook { text: book, index }).unwrap());
+            handles.push(local.insert_book(OpenBook { text: book, index }).unwrap());
         }
         let book =
             perch_jobs::extract_epub_text(&epub_fixture(), perch_jobs::ExtractOptions::default())
                 .unwrap();
         let index = perch_jobs::index_book(&book, 64);
-        let error = local.insert(OpenBook { text: book, index }).unwrap_err();
+        let error = local
+            .insert_book(OpenBook { text: book, index })
+            .unwrap_err();
         assert_eq!(error.code, "BOOK_TOO_MANY_OPEN");
 
         // 句柄互不相同且单调（永不复用）
@@ -1080,5 +1369,264 @@ mod tests {
         let args = json!({ "state": [], "since": "不是HLC" }).to_string();
         let out = dispatch("sync.delta", &args);
         assert_eq!(out["error"]["code"], "SYNC_BAD_HLC");
+    }
+
+    // ---------- TXT 阅读路径（句柄化）----------
+
+    /// 造一个临时 TXT 文件。用真实文件而不是 bytes：`txt.open` 走的就是
+    /// `std::fs` 这条路，得把"路径 → 解码 → 索引"整条链验掉。
+    fn txt_fixture_file(name: &str, text: &str) -> std::path::PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("perch-ffi-txt-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("book.txt");
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        path
+    }
+
+    fn open_txt(name: &str, text: &str) -> Value {
+        let path = txt_fixture_file(name, text);
+        call_ok(
+            "txt.open",
+            &json!({ "path": path.to_string_lossy() }).to_string(),
+        )
+    }
+
+    #[test]
+    fn txt_open_slice_locate_round_trip() {
+        let _serial = serial();
+        let text = "第一章 灯塔\n\n守夜人每天爬上灯塔。\n第二行在这里。\n第三行。";
+        let out = open_txt("roundtrip", text);
+        let handle = out["handle"].as_u64().unwrap();
+        assert_eq!(out["chars"].as_u64().unwrap(), text.chars().count() as u64);
+        assert_eq!(out["lines"].as_u64().unwrap(), text.lines().count() as u64);
+        assert_eq!(out["encoding"], "UTF-8");
+        assert_eq!(out["certain"], true);
+        assert_eq!(out["hadErrors"], false);
+
+        // 取一屏：**字符**偏移，不是字节偏移（中文一个字符 3 字节）
+        let slice = call_ok(
+            "txt.slice",
+            &json!({ "handle": handle, "start": 3, "chars": 5 }).to_string(),
+        );
+        let expected: String = text.chars().skip(3).take(5).collect();
+        assert_eq!(slice["text"], expected);
+        assert_eq!(slice["chars"], 5);
+        assert_eq!(
+            slice["total"].as_u64().unwrap(),
+            text.chars().count() as u64
+        );
+
+        // 字符偏移 → Locator → 字符偏移（跨端同步靠这条链）
+        let located = call_ok(
+            "txt.locate",
+            &json!({ "handle": handle, "char": 5 }).to_string(),
+        );
+        assert_eq!(located["locator"]["perch"]["txtOffset"], 5);
+        assert_eq!(located["locator"]["perch"]["format"], "txt");
+
+        let back = call_ok(
+            "txt.offset",
+            &json!({ "handle": handle, "locator": located["locator"] }).to_string(),
+        );
+        assert_eq!(back["char"].as_u64().unwrap(), 5);
+        assert_eq!(back["resolved"], true);
+
+        // 行号与行区间
+        let line = call_ok(
+            "txt.line",
+            &json!({ "handle": handle, "char": 5 }).to_string(),
+        );
+        assert_eq!(line["line"], 0);
+        assert_eq!(line["start"], 0);
+        assert_eq!(
+            line["totalLines"].as_u64().unwrap(),
+            text.lines().count() as u64
+        );
+
+        // 关掉之后旧句柄必须失效，而不是误操作到别的对象
+        let closed = call_ok("txt.close", &json!({ "handle": handle }).to_string());
+        assert_eq!(closed["closed"], true);
+        let again = dispatch(
+            "txt.slice",
+            &json!({ "handle": handle, "chars": 1 }).to_string(),
+        );
+        assert_eq!(again["error"]["code"], "TXT_BAD_HANDLE");
+    }
+
+    #[test]
+    fn txt_open_missing_file_is_txt_io_not_bad_args() {
+        let _serial = serial();
+        let out = dispatch("txt.open", r#"{"path":"/nonexistent/perch-book.txt"}"#);
+        assert_eq!(out["error"]["code"], "TXT_IO");
+    }
+
+    #[test]
+    fn txt_open_honours_explicit_encoding() {
+        let _serial = serial();
+        // GBK 的"中文"（D6 D0 CE C4）；不给 encoding 时靠探测，
+        // 这么短的样本探测没把握，所以显式指定这条路必须能用。
+        let directory = std::env::temp_dir().join(format!("perch-ffi-gbk-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("gbk.txt");
+        std::fs::write(&path, [0xD6u8, 0xD0, 0xCE, 0xC4]).unwrap();
+
+        let out = call_ok(
+            "txt.open",
+            &json!({ "path": path.to_string_lossy(), "encoding": "gbk" }).to_string(),
+        );
+        assert_eq!(out["chars"], 2);
+        assert_eq!(out["certain"], true);
+
+        let bad = dispatch(
+            "txt.open",
+            &json!({ "path": path.to_string_lossy(), "encoding": "不存在的编码" }).to_string(),
+        );
+        assert_eq!(bad["error"]["code"], "TXT_UNKNOWN_ENCODING");
+        call_ok("txt.close", &json!({ "handle": out["handle"] }).to_string());
+    }
+
+    #[test]
+    fn txt_slice_bounds_are_explicit() {
+        let _serial = serial();
+        let text = "一二三四五六七八九十";
+        let out = open_txt("bounds", text);
+        let handle = out["handle"].as_u64().unwrap();
+        let total = text.chars().count() as u64;
+
+        // 末尾不足一屏：按实际长度返回（最后一页就是这个形状）
+        let tail = call_ok(
+            "txt.slice",
+            &json!({ "handle": handle, "start": total - 3, "chars": 100 }).to_string(),
+        );
+        assert_eq!(tail["chars"], 3);
+
+        // 0 个字符 / 超过上限：明确报错，不悄悄截断
+        let zero = dispatch(
+            "txt.slice",
+            &json!({ "handle": handle, "chars": 0 }).to_string(),
+        );
+        assert_eq!(zero["error"]["code"], "TXT_SLICE_BAD_SIZE");
+        let too_big = dispatch(
+            "txt.slice",
+            &json!({ "handle": handle, "chars": MAX_TXT_SLICE_CHARS + 1 }).to_string(),
+        );
+        assert_eq!(too_big["error"]["code"], "TXT_SLICE_BAD_SIZE");
+        let missing = dispatch("txt.slice", &json!({ "handle": handle }).to_string());
+        assert_eq!(missing["error"]["code"], "FFI_BAD_ARGS");
+
+        // start 越界
+        let beyond = dispatch(
+            "txt.slice",
+            &json!({ "handle": handle, "start": total + 1, "chars": 1 }).to_string(),
+        );
+        assert_eq!(beyond["error"]["code"], "TXT_OUT_OF_RANGE");
+        call_ok("txt.close", &json!({ "handle": handle }).to_string());
+    }
+
+    #[test]
+    fn txt_offset_unresolved_locator_is_a_result_not_an_error() {
+        let _serial = serial();
+        // 定位不出来的 Locator 是**正常业务结果**：调用方要能退回 progression，
+        // 所以返回 `char: null`，而不是抛错。
+        let out = open_txt("unresolved", "一二三四五");
+        let handle = out["handle"].as_u64().unwrap();
+        let foreign = json!({
+            "href": "/OEBPS/chap01.xhtml",
+            "type": "application/xhtml+xml",
+            "locations": { "progression": 0.5 },
+        });
+        let resolved = call_ok(
+            "txt.offset",
+            &json!({ "handle": handle, "locator": foreign }).to_string(),
+        );
+        // 没有 perch 字段时退到 progression：0.5 × 5 字符 ≈ 3
+        assert_eq!(resolved["resolved"], true);
+        assert_eq!(resolved["char"], 3);
+        call_ok("txt.close", &json!({ "handle": handle }).to_string());
+    }
+
+    #[test]
+    fn handle_kinds_are_not_interchangeable() {
+        let _serial = serial();
+        let out = open_txt("kinds", "一二三四五");
+        let txt_handle = out["handle"].as_u64().unwrap();
+
+        // 拿 TXT 句柄去查索引 → 类型错误（而不是"句柄不存在"那种含糊信息）
+        let search = dispatch(
+            "book.search",
+            &json!({ "handle": txt_handle, "query": "一" }).to_string(),
+        );
+        assert_eq!(search["error"]["code"], "HANDLE_WRONG_KIND");
+
+        // 拿 TXT 句柄去 book.close：必须拒绝，**且不能真把它关掉**
+        let wrong_close = dispatch("book.close", &json!({ "handle": txt_handle }).to_string());
+        assert_eq!(wrong_close["error"]["code"], "HANDLE_WRONG_KIND");
+        let still_alive = call_ok(
+            "txt.slice",
+            &json!({ "handle": txt_handle, "start": 0, "chars": 1 }).to_string(),
+        );
+        assert_eq!(still_alive["text"], "一");
+
+        // 反过来：book 句柄不能走 txt.*
+        let book_handle = open_book();
+        let wrong_slice = dispatch(
+            "txt.slice",
+            &json!({ "handle": book_handle, "chars": 1 }).to_string(),
+        );
+        assert_eq!(wrong_slice["error"]["code"], "HANDLE_WRONG_KIND");
+        call_ok("book.close", &json!({ "handle": book_handle }).to_string());
+        call_ok("txt.close", &json!({ "handle": txt_handle }).to_string());
+    }
+
+    #[test]
+    fn txt_quota_is_separate_from_book_quota() {
+        // 阅读句柄不该被后台索引任务挤掉：两类**分开计数**（docs/11 §5.2 ①）。
+        let mut local = Registry::default();
+
+        for _ in 0..MAX_OPEN_BOOKS {
+            let text =
+                perch_jobs::extract_txt(b"hello", perch_jobs::ExtractOptions::default()).unwrap();
+            local
+                .insert_book(OpenBook {
+                    text,
+                    index: perch_index::Index::build("hello", 64),
+                })
+                .unwrap();
+        }
+        let text =
+            perch_jobs::extract_txt(b"hello", perch_jobs::ExtractOptions::default()).unwrap();
+        let error = local
+            .insert_book(OpenBook {
+                text,
+                index: perch_index::Index::build("hello", 64),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "BOOK_TOO_MANY_OPEN");
+
+        // 书配额满了，TXT 照开不误
+        let handle = local
+            .insert_txt(perch_txt::TxtDocument::from_bytes("阅读优先".as_bytes()))
+            .unwrap();
+        assert_eq!(local.txt(handle).unwrap().char_count(), 4);
+
+        // 但 TXT 自己也有上限
+        for _ in 1..MAX_OPEN_TXT {
+            local
+                .insert_txt(perch_txt::TxtDocument::from_bytes(b"x"))
+                .unwrap();
+        }
+        let error = local
+            .insert_txt(perch_txt::TxtDocument::from_bytes(b"x"))
+            .unwrap_err();
+        assert_eq!(error.code, "TXT_TOO_MANY_OPEN");
+
+        // 关一个就把名额还回来
+        local.remove(handle);
+        assert!(
+            local
+                .insert_txt(perch_txt::TxtDocument::from_bytes(b"x"))
+                .is_ok()
+        );
     }
 }

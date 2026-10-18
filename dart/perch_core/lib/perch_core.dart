@@ -152,9 +152,36 @@ class PerchCore {
         'tail_hex': _hex(tail),
       })['fingerprint'] as String;
 
-  /// 分析纯文本（编码探测 + 统计）。
+  /// 分析纯文本（编码探测 + 统计）——**只给导入阶段用**。
+  ///
+  /// ⚠️ 它要 `bytes_hex`，而且把**全文**当 JSON 字符串吐回来：
+  /// 一个 10MB 的 TXT 在边界上要变成 20MB 的十六进制串再回来 10MB 文本。
+  /// 阅读路径请用 [openTxt] + [TxtHandle.slice]（`docs/11` §5.2 ①）。
   Map<String, dynamic> analyzeText(List<int> bytes) =>
       invoke('txt.analyze', {'bytes_hex': _hex(bytes)});
+
+  /// 打开一个 TXT 文件用于阅读（句柄化，**不建倒排索引**）。
+  ///
+  /// [encoding] 传 `'gbk'` / `'big5'` 之类可以跳过探测（对很短的样本，
+  /// `chardetng` 的猜测没把握）；不传就走 BOM → 合法 UTF-8 → 猜测。
+  ///
+  /// 句柄由调用方负责释放（[TxtHandle.close]）。同时最多 4 个，与书索引的
+  /// 配额**分开计数**——后台建索引任务再多也挤不掉阅读句柄。
+  TxtHandle openTxt(String path, {String? encoding}) {
+    final result = invoke('txt.open', {
+      'path': path,
+      if (encoding != null) 'encoding': encoding,
+    });
+    return TxtHandle._(
+      this,
+      result['handle'] as int,
+      chars: result['chars'] as int,
+      lines: result['lines'] as int,
+      encoding: result['encoding'] as String,
+      certain: result['certain'] as bool? ?? false,
+      hadErrors: result['hadErrors'] as bool? ?? false,
+    );
+  }
 
   /// 全文检索。
   List<Map<String, dynamic>> search(
@@ -270,4 +297,169 @@ class PerchCore {
     }
     return buffer.toString();
   }
+}
+
+/// 一屏文本。
+class TxtSlice {
+  const TxtSlice({
+    required this.text,
+    required this.start,
+    required this.end,
+    required this.total,
+  });
+
+  /// 文本本身。
+  final String text;
+
+  /// 起始字符偏移（含）。
+  final int start;
+
+  /// 结束字符偏移（不含）。
+  final int end;
+
+  /// 全书总字符数（用来画进度条）。
+  final int total;
+
+  /// 本屏字符数。
+  int get chars => end - start;
+
+  @override
+  String toString() => 'TxtSlice($start..$end of $total, ${text.length} 字符)';
+}
+
+/// 一行在全文里的位置。
+class TxtLine {
+  const TxtLine({required this.line, this.start, this.end, required this.totalLines});
+
+  /// 0 基行号。
+  final int line;
+
+  /// 该行的起始字符偏移（取不到时为 null）。
+  final int? start;
+
+  /// 该行的结束字符偏移（不含）。
+  final int? end;
+
+  /// 总行数。
+  final int totalLines;
+}
+
+/// 一个已打开的 TXT 文档。
+///
+/// **生命周期归调用方：用完必须 [close]**。句柄在 Rust 侧自增且永不复用，
+/// 所以"关掉之后又拿来用"只会得到明确的 `TXT_BAD_HANDLE`，不会误操作到别的书。
+class TxtHandle {
+  TxtHandle._(
+    this._core,
+    this.handle, {
+    required this.chars,
+    required this.lines,
+    required this.encoding,
+    required this.certain,
+    required this.hadErrors,
+  });
+
+  final PerchCore _core;
+
+  /// Rust 侧的句柄。一般不用直接碰它。
+  final int handle;
+
+  /// 全书字符数（**不是字节数**：中文一个字符 3 字节）。
+  final int chars;
+
+  /// 全书行数。
+  final int lines;
+
+  /// 实际使用的编码名（如 `UTF-8` / `GBK`）。
+  final String encoding;
+
+  /// 编码是否**确定**：为 false 说明是猜测，UI 应当提供"换个编码重读"。
+  final bool certain;
+
+  /// 解码时是否出现过非法序列（出现即说明编码可能选错了）。
+  final bool hadErrors;
+
+  bool _closed = false;
+
+  /// 取一屏文本。
+  ///
+  /// [start] / [chars] 都是**字符**数。`chars` 有上限（2 万），
+  /// 超过会抛 `TXT_SLICE_BAD_SIZE`——这是故意的：一次取整本书是调用方的 bug，
+  /// 早点炸比悄悄传一个 10MB 字符串好。末页不足一屏是正常的，按实际长度返回。
+  TxtSlice slice(int start, int chars) {
+    _ensureOpen('slice');
+    final result = _core.invoke('txt.slice', {
+      'handle': handle,
+      'start': start,
+      'chars': chars,
+    });
+    return TxtSlice(
+      text: result['text'] as String,
+      start: result['start'] as int,
+      end: result['end'] as int,
+      total: result['total'] as int,
+    );
+  }
+
+  /// 字符偏移 → Locator（进度落库、跨端同步都用它）。
+  Map<String, dynamic> locate(int charOffset) {
+    _ensureOpen('locate');
+    final result = _core.invoke('txt.locate', {
+      'handle': handle,
+      'char': charOffset,
+    });
+    return (result['locator'] as Map).cast<String, dynamic>();
+  }
+
+  /// Locator → 字符偏移。
+  ///
+  /// 返回 `null` 表示**这个 Locator 在本文件里定位不出来**——这不是错误，
+  /// 调用方应当退回 `locations.progression`（Rust 侧的三级回退链已经在内部试过
+  /// 字符偏移 → 字节偏移 → 进度）。
+  int? offsetOf(Map<String, dynamic> locator) {
+    _ensureOpen('offsetOf');
+    final result = _core.invoke('txt.offset', {
+      'handle': handle,
+      'locator': locator,
+    });
+    return result['char'] as int?;
+  }
+
+  /// 字符偏移 → 行号与该行的字符区间（排版、目录、跳转都要用）。
+  TxtLine lineAt(int charOffset) {
+    _ensureOpen('lineAt');
+    final result = _core.invoke('txt.line', {
+      'handle': handle,
+      'char': charOffset,
+    });
+    return TxtLine(
+      line: result['line'] as int,
+      start: result['start'] as int?,
+      end: result['end'] as int?,
+      totalLines: result['totalLines'] as int,
+    );
+  }
+
+  /// 释放。（重复调用是安全的。）
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _core.invoke('txt.close', {'handle': handle});
+  }
+
+  void _ensureOpen(String method) {
+    if (_closed) {
+      throw StateError(
+        'TxtHandle.$method：这个句柄已经 close 过了（句柄 $handle）。'
+        '句柄在核心侧自增且永不复用，请重新 openTxt。',
+      );
+    }
+  }
+
+  @override
+  String toString() =>
+      'TxtHandle($handle, $encoding, $chars 字符/$lines 行'
+      '${certain ? '' : ', 编码为猜测'})';
 }
